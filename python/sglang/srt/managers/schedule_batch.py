@@ -1268,6 +1268,28 @@ class Req(ReqDllmMixin):
         else:
             self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
 
+    def sync_fill_ids_from_origin_suffix(self, prefix_len: int) -> None:
+        """Propagate a scheduler-side prompt rewrite into the carried fill ids.
+
+        Streaming-session appends carry ``full_untruncated_fill_ids`` to avoid
+        rebuilding the full history. Multimodal padding happens later and
+        rewrites placeholder tokens in ``origin_input_ids``. Mirror only that
+        suffix so visual-embedding masks see the per-item pad values.
+        """
+        if prefix_len < 0 or prefix_len > len(self.origin_input_ids):
+            raise ValueError(
+                f"fill-id sync prefix out of range: {prefix_len=} "
+                f"origin_len={len(self.origin_input_ids)}"
+            )
+        if len(self.full_untruncated_fill_ids) != len(self.origin_input_ids):
+            # A fresh request or inconsistent speculative carry is rebuilt by
+            # init_next_round_input().
+            self.full_untruncated_fill_ids = array("q")
+            return
+        self.full_untruncated_fill_ids[prefix_len:] = self.origin_input_ids[
+            prefix_len:
+        ]
+
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,

@@ -170,6 +170,21 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(list(r2.origin_input_ids), [1, 2, 3, 4, 5])
         self.assertNotIn(999, r2.origin_input_ids)
 
+    def test_multimodal_padding_updates_carried_fill_suffix(self):
+        """A later chunk's padded placeholders must reach the forward mask."""
+        r1 = self._create("r1", [1, 2, 3])
+        self._decode_and_finish(r1, [])
+
+        r2 = self._create("r2", [4, 5, 6])
+        self.assertEqual(list(r2.full_untruncated_fill_ids), [1, 2, 3, 4, 5, 6])
+
+        # The scheduler rewrites only this chunk's multimodal placeholders.
+        r2.origin_input_ids[4:] = array("q", [1005, 1006])
+        r2.sync_fill_ids_from_origin_suffix(prefix_len=3)
+        self.assertEqual(
+            list(r2.full_untruncated_fill_ids), [1, 2, 3, 4, 1005, 1006]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

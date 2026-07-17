@@ -2243,9 +2243,10 @@ class Scheduler(
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
 
-            sequence_prefix_len = SessionController.adjust_mm_offsets(
+            fill_sync_prefix_len = SessionController.adjust_mm_offsets(
                 recv_req, req, image_inputs
             )
+            sequence_prefix_len = fill_sync_prefix_len
             if req.session is None or not req.session.streaming:
                 sequence_prefix_len = None
 
@@ -2262,6 +2263,8 @@ class Scheduler(
             req.extend_image_inputs(
                 image_inputs, sequence_prefix_len=sequence_prefix_len
             )
+            if req.session is not None and req.session.streaming:
+                req.sync_fill_ids_from_origin_suffix(fill_sync_prefix_len)
             self._maybe_compute_mrope_positions(req)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
