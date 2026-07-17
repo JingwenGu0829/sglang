@@ -16,6 +16,7 @@ import logging
 import time
 import uuid
 from array import array
+from copy import copy
 from typing import TYPE_CHECKING, Dict, Optional
 
 from sglang.srt.managers.io_struct import (
@@ -109,15 +110,38 @@ class Session:
 
     @staticmethod
     def _strip_bos_token(req: TokenizedGenerateReqInput, tokenizer) -> None:
-        """Trim a leading BOS on an appended turn; shift mm offsets to match."""
+        """Trim a leading BOS and the corresponding multimodal metadata.
+
+        Multimodal processors run before the scheduler sees the session.  Their
+        M-RoPE positions and optional padded ids therefore still contain the
+        leading BOS that is removed from an appended turn here.  Keeping that
+        column would make the position tensor one token longer than the prompt
+        and would shift all later visual positions by one.
+        """
         if not (
             tokenizer is not None
             and req.input_ids
             and req.input_ids[0] == tokenizer.bos_token_id
         ):
             return
+        old_input_len = len(req.input_ids)
         req.input_ids = req.input_ids[1:]
         if req.mm_inputs:
+            padded_input_ids = getattr(req.mm_inputs, "padded_input_ids", None)
+            if padded_input_ids is not None and len(padded_input_ids) == old_input_len:
+                req.mm_inputs.padded_input_ids = padded_input_ids[1:]
+
+            mrope_positions = getattr(req.mm_inputs, "mrope_positions", None)
+            if (
+                mrope_positions is not None
+                and mrope_positions.ndim == 2
+                and mrope_positions.shape[1] == old_input_len
+            ):
+                # BOS is a text token at local position zero.  Removing its
+                # column and rebasing by one is equivalent to computing M-RoPE
+                # for the suffix without a BOS.  The position delta is unchanged.
+                req.mm_inputs.mrope_positions = mrope_positions[:, 1:] - 1
+
             for item in req.mm_inputs.mm_items:
                 if item.offsets:
                     if any(s == 0 for s, _ in item.offsets):
@@ -315,7 +339,34 @@ class Session:
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
         )
-        if last_req is not None:
+        if (
+            self.streaming
+            and last_req is not None
+            and last_req.multimodal_inputs is not None
+        ):
+            # Keep the committed request immutable while the append is in
+            # flight.  A failed/aborted append must not leave speculative
+            # mm_items or M-RoPE metadata in the session rollback point.
+            new_req.multimodal_inputs = copy(last_req.multimodal_inputs)
+            new_req.multimodal_inputs.mm_items = list(
+                last_req.multimodal_inputs.mm_items
+            )
+            if last_req.multimodal_inputs.image_pad_len is not None:
+                new_req.multimodal_inputs.image_pad_len = list(
+                    last_req.multimodal_inputs.image_pad_len
+                )
+
+            # M-RoPE tensors from the prior turn end at its prompt.  Fill the
+            # generated-token gap, and for a text-only append fill the new text
+            # as well.  A new multimodal chunk is merged (and rebased) later in
+            # the scheduler once its processor output has been reconstructed.
+            mrope_target_len = len(input_ids)
+            if req.mm_inputs is not None:
+                mrope_target_len -= len(req.input_ids)
+            new_req.multimodal_inputs.resize_mrope_positions_for_text(
+                mrope_target_len
+            )
+        elif last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
         new_req.tokenizer = tokenizer
         if carry_fill is not None:
@@ -475,7 +526,7 @@ class SessionController:
         # Session.create_req prepends previous context to origin_input_ids,
         # so offsets from the new prompt need to be shifted.
         if len(recv_req.input_ids) >= len(req.origin_input_ids):
-            return
+            return 0
         prefix_len = len(req.origin_input_ids) - len(recv_req.input_ids)
         for mm_item in image_inputs.mm_items:
             if mm_item.offsets:
@@ -483,3 +534,4 @@ class SessionController:
                     (start + prefix_len, end + prefix_len)
                     for start, end in mm_item.offsets
                 ]
+        return prefix_len

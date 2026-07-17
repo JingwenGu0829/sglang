@@ -2243,7 +2243,11 @@ class Scheduler(
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
 
-            SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
+            sequence_prefix_len = SessionController.adjust_mm_offsets(
+                recv_req, req, image_inputs
+            )
+            if req.session is None or not req.session.streaming:
+                sequence_prefix_len = None
 
             # The following steps are already fast, execute locally on each rank.
             # Expand a single image token into multiple dummy tokens for receiving image embeddings.
@@ -2255,7 +2259,9 @@ class Scheduler(
                 req.origin_input_ids = array(
                     "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
                 )
-            req.extend_image_inputs(image_inputs)
+            req.extend_image_inputs(
+                image_inputs, sequence_prefix_len=sequence_prefix_len
+            )
             self._maybe_compute_mrope_positions(req)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:

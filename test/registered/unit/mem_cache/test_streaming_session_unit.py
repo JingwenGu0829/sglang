@@ -226,6 +226,24 @@ def test_trim_overshoot_postcondition():
     assert allocator.freed[0].tolist() == list(range(38, 44))
 
 
+def test_prefill_only_boundary_sample_does_not_advance_committed_kv():
+    """The sampled max_new_tokens=0 boundary has no KV row to retain."""
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, _FakeAllocator(), page_size=1)
+    )
+
+    req = _FakeReq("session-a", req_pool_idx=0, committed=3, allocated=3)
+    req.output_ids = [999]  # sampled by the final prefill forward
+    req.finished_len = 0
+
+    assert tree_cache.try_cache_finished_req(req)
+    slot = tree_cache.slots["session-a"]
+    assert slot.kv_committed_len == len(req.origin_input_ids)
+    assert req.output_ids == []
+
+
 if __name__ == "__main__":
     import sys
 

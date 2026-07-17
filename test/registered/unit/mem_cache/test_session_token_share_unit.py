@@ -159,6 +159,17 @@ class TestSessionTokenShare(CustomTestCase):
         r2._refresh_fill_ids()
         self.assertEqual(list(r2.full_untruncated_fill_ids), list(r2.origin_input_ids))
 
+    def test_prefill_only_boundary_sample_is_not_committed(self):
+        """max_new_tokens=0 samples a boundary token but performs no decode."""
+        r1 = self._create("r1", [1, 2, 3], max_new_tokens=0)
+        r1.output_ids.append(999)
+        r1._refresh_fill_ids()
+        self.session.finish_req(r1)
+
+        r2 = self._create("r2", [4, 5])
+        self.assertEqual(list(r2.origin_input_ids), [1, 2, 3, 4, 5])
+        self.assertNotIn(999, r2.origin_input_ids)
+
 
 if __name__ == "__main__":
     unittest.main()

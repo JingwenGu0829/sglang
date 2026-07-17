@@ -638,9 +638,77 @@ class MultimodalInputs:
                 video_tokens += num_tokens
         return image_tokens, audio_tokens, video_tokens
 
-    def merge(self, other: MultimodalInputs):
+    def _mrope_delta_scalar(self) -> Optional[torch.Tensor]:
+        if self.mrope_position_delta is None:
+            return None
+        flat = self.mrope_position_delta.reshape(-1)
+        if flat.numel() != 1:
+            raise ValueError(
+                "Sequential multimodal append requires one M-RoPE delta, "
+                f"got shape {tuple(self.mrope_position_delta.shape)}"
+            )
+        return flat[0]
+
+    def resize_mrope_positions_for_text(self, target_len: int) -> None:
+        """Resize M-RoPE metadata across a text-only suffix.
+
+        Qwen-style M-RoPE stores explicit positions for the prompt and a scalar
+        delta used for subsequent text/decode positions.  Session output tokens
+        and text-only appends can therefore be represented without recomputing
+        positions for the full retained context.
         """
-        merge image inputs when requests are being merged
+        positions = self.mrope_positions
+        delta = self._mrope_delta_scalar()
+        if positions is None or delta is None:
+            return
+        if target_len < 0:
+            raise ValueError(f"M-RoPE target length must be non-negative: {target_len}")
+
+        current_len = positions.shape[1]
+        if target_len <= current_len:
+            self.mrope_positions = positions[:, :target_len]
+        else:
+            text_positions = torch.arange(
+                current_len,
+                target_len,
+                dtype=positions.dtype,
+                device=positions.device,
+            )
+            text_positions = text_positions.unsqueeze(0).expand(
+                positions.shape[0], -1
+            )
+            self.mrope_positions = torch.cat(
+                [positions, text_positions + delta.to(positions.device)], dim=1
+            )
+        self.mrope_position_delta_repeated_cache = None
+
+    def _prepend_mrope_text_prefix(self, prefix_len: int) -> None:
+        """Rebase independently processed M-RoPE after a text-only prefix."""
+        if self.mrope_positions is None or prefix_len == 0:
+            return
+        prefix = torch.arange(
+            prefix_len,
+            dtype=self.mrope_positions.dtype,
+            device=self.mrope_positions.device,
+        ).unsqueeze(0).expand(self.mrope_positions.shape[0], -1)
+        self.mrope_positions = torch.cat(
+            [prefix, self.mrope_positions + prefix_len], dim=1
+        )
+        self.mrope_position_delta_repeated_cache = None
+
+    def merge(
+        self,
+        other: MultimodalInputs,
+        *,
+        sequence_prefix_len: Optional[int] = None,
+    ):
+        """
+        Merge multimodal inputs.
+
+        ``sequence_prefix_len`` is set for a session append.  In that case
+        ``other`` was processed as an independent prompt, so its M-RoPE starts
+        at zero and must be rebased after the retained prefix.  Without it this
+        retains the legacy batch-merge behavior.
         """
 
         # args needed to be merged
@@ -654,22 +722,41 @@ class MultimodalInputs:
                 setattr(self, arg, self_arg + getattr(other, arg))
 
         mrope_positions = self.mrope_positions
-        if mrope_positions is not None:
-            if other.mrope_positions is None:
-                self.mrope_positions = mrope_positions
-            else:
+        if sequence_prefix_len is None:
+            if mrope_positions is not None and other.mrope_positions is not None:
                 self.mrope_positions = torch.cat(
-                    [self.mrope_positions, other.mrope_positions], dim=1
+                    [mrope_positions, other.mrope_positions], dim=1
                 )
 
-        mrope_position_delta = self.mrope_position_delta
-        if mrope_position_delta is not None:
-            if other.mrope_position_delta is None:
-                self.mrope_position_delta = mrope_position_delta
-            else:
+            if (
+                self.mrope_position_delta is not None
+                and other.mrope_position_delta is not None
+            ):
                 self.mrope_position_delta = torch.cat(
                     [self.mrope_position_delta, other.mrope_position_delta], dim=0
                 )
+        elif other.mrope_positions is not None:
+            self.resize_mrope_positions_for_text(sequence_prefix_len)
+            old_delta = self._mrope_delta_scalar()
+            new_delta = other._mrope_delta_scalar()
+            if mrope_positions is None or old_delta is None:
+                # The retained context was text-only; synthesize its ordinary
+                # positions before placing the first multimodal chunk.
+                other._prepend_mrope_text_prefix(sequence_prefix_len)
+                self.mrope_positions = other.mrope_positions
+                self.mrope_position_delta = other.mrope_position_delta
+            elif new_delta is not None:
+                rebased = other.mrope_positions + (
+                    sequence_prefix_len + old_delta.to(other.mrope_positions.device)
+                )
+                self.mrope_positions = torch.cat(
+                    [self.mrope_positions, rebased], dim=1
+                )
+                combined_delta = old_delta + new_delta.to(old_delta.device)
+                self.mrope_position_delta = combined_delta.reshape_as(
+                    self.mrope_position_delta
+                )
+            self.mrope_position_delta_repeated_cache = None
 
         for key, val in other.__dict__.items():
             if "_id" in key:
@@ -1140,11 +1227,15 @@ class Req(ReqDllmMixin):
             )
         self.spec_cap_lens_histogram[cap_len] += 1
 
-    def extend_image_inputs(self, image_inputs):
+    def extend_image_inputs(self, image_inputs, *, sequence_prefix_len=None):
         if self.multimodal_inputs is None:
+            if sequence_prefix_len:
+                image_inputs._prepend_mrope_text_prefix(sequence_prefix_len)
             self.multimodal_inputs = image_inputs
         else:
-            self.multimodal_inputs.merge(image_inputs)
+            self.multimodal_inputs.merge(
+                image_inputs, sequence_prefix_len=sequence_prefix_len
+            )
 
     def finished(self) -> bool:
         # Whether request reached finished condition
