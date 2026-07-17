@@ -199,6 +199,19 @@ class Session:
         return input_ids, input_ids_unpadded, carry_fill
 
     @staticmethod
+    def _copy_mm_items_for_append(mm_items):
+        """Copy item records while retaining immutable feature tensor storage."""
+
+        copied = []
+        for item in mm_items:
+            cloned = copy(item)
+            if item.offsets is not None:
+                cloned.offsets = list(item.offsets)
+            cloned.model_specific_data = dict(item.model_specific_data)
+            copied.append(cloned)
+        return copied
+
+    @staticmethod
     def _concat_token_arrays(
         last_req: Req, req: TokenizedGenerateReqInput, session_params
     ):
@@ -348,7 +361,7 @@ class Session:
             # flight.  A failed/aborted append must not leave speculative
             # mm_items or M-RoPE metadata in the session rollback point.
             new_req.multimodal_inputs = copy(last_req.multimodal_inputs)
-            new_req.multimodal_inputs.mm_items = list(
+            new_req.multimodal_inputs.mm_items = self._copy_mm_items_for_append(
                 last_req.multimodal_inputs.mm_items
             )
             if last_req.multimodal_inputs.image_pad_len is not None:

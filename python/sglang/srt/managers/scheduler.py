@@ -1996,22 +1996,27 @@ class Scheduler(
             req.origin_input_ids = req.origin_input_ids[:prefix_len] + padded_input_ids
         return True
 
-    def _maybe_compute_mrope_positions(self, req) -> None:
-        """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
-        if self._mm_processor is None:
+    def _maybe_compute_mrope_positions_for_inputs(self, input_ids, mm) -> None:
+        """Compute local M-RoPE metadata before session offset/merge rewrites."""
+        if self._mm_processor is None or input_ids is None:
             return
-        mm = req.multimodal_inputs
         if mm is None or mm.mrope_positions is not None:
             return
 
         mrope_positions, mrope_position_delta = (
             self._mm_processor.compute_mrope_positions(
-                req.origin_input_ids, mm.mm_items
+                input_ids, mm.mm_items
             )
         )
         if mrope_positions is not None:
             mm.mrope_positions = mrope_positions
             mm.mrope_position_delta = mrope_position_delta
+
+    def _maybe_compute_mrope_positions(self, req) -> None:
+        """Compute aggregate M-RoPE positions when no local metadata exists."""
+        self._maybe_compute_mrope_positions_for_inputs(
+            req.origin_input_ids, req.multimodal_inputs
+        )
 
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
         if (
@@ -2242,6 +2247,9 @@ class Scheduler(
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+            self._maybe_compute_mrope_positions_for_inputs(
+                recv_req.input_ids, image_inputs
+            )
 
             fill_sync_prefix_len = SessionController.adjust_mm_offsets(
                 recv_req, req, image_inputs
@@ -2533,6 +2541,9 @@ class Scheduler(
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+            self._maybe_compute_mrope_positions_for_inputs(
+                recv_req.input_ids, image_inputs
+            )
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             # The `pad_input_ids_func` is model-specific and may be None for
             # embedding models or models not requiring special padding.

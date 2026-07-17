@@ -12,6 +12,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session, SessionController
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -194,10 +195,45 @@ class TestStreamingSessionMrope(CustomTestCase):
         torch.testing.assert_close(req.multimodal_inputs.mrope_positions, expected_positions)
         torch.testing.assert_close(req.multimodal_inputs.mrope_position_delta, expected_delta)
 
+    def test_missing_chunk_mrope_is_computed_before_session_merge(self):
+        first = [BOS, 5, VISION_START, IMAGE, IMAGE, IMAGE, IMAGE, 6]
+        output = [7, 8]
+        second_with_bos = [BOS, 9, VISION_START, IMAGE, IMAGE, IMAGE, IMAGE, 10]
+        self._first_turn(first, output)
+
+        processor_output = MultimodalProcessorOutput(
+            input_ids=second_with_bos,
+            padded_input_ids=list(second_with_bos),
+            mm_items=[_item((3, 6))],
+        )
+        recv = _recv("r2", second_with_bos, mm_inputs=processor_output)
+        req = self.session.create_req(recv, tokenizer=self.tokenizer, vocab_size=VOCAB)
+        new_mm = MultimodalInputs(mm_items=processor_output.mm_items)
+
+        processor = SimpleNamespace(
+            compute_mrope_positions=lambda input_ids, _items: _mrope(
+                list(input_ids), GRID
+            )
+        )
+        scheduler = SimpleNamespace(_mm_processor=processor)
+        Scheduler._maybe_compute_mrope_positions_for_inputs(
+            scheduler, recv.input_ids, new_mm
+        )
+        prefix_len = SessionController.adjust_mm_offsets(recv, req, new_mm)
+        req.extend_image_inputs(new_mm, sequence_prefix_len=prefix_len)
+
+        expected_positions, expected_delta = _mrope(
+            first + output + second_with_bos[1:], GRID + GRID
+        )
+        self.assertEqual(req.multimodal_inputs.mrope_positions.shape[1], len(req.origin_input_ids))
+        torch.testing.assert_close(req.multimodal_inputs.mrope_positions, expected_positions)
+        torch.testing.assert_close(req.multimodal_inputs.mrope_position_delta, expected_delta)
+
     def test_aborted_multimodal_append_does_not_mutate_rollback_point(self):
         first = [BOS, 5, VISION_START, IMAGE, IMAGE, IMAGE, IMAGE, 6]
         self._first_turn(first, [])
         committed_mm = next(iter(self.session.req_nodes.values())).req.multimodal_inputs
+        committed_mm.mm_items[0].feature = torch.ones(1)
 
         second = MultimodalInputs(
             mm_items=[_item((10, 13))],
@@ -211,7 +247,10 @@ class TestStreamingSessionMrope(CustomTestCase):
         )
         aborted.extend_image_inputs(second, sequence_prefix_len=len(first))
         self.assertIsNot(aborted.multimodal_inputs, committed_mm)
+        self.assertIsNot(aborted.multimodal_inputs.mm_items[0], committed_mm.mm_items[0])
         self.assertEqual(len(aborted.multimodal_inputs.mm_items), 2)
+        aborted.multimodal_inputs.release_features()
+        self.assertIsNotNone(committed_mm.mm_items[0].feature)
         self.session.abort_req()
 
         continued = self.session.create_req(_recv("r3", [30]), tokenizer=None, vocab_size=VOCAB)
