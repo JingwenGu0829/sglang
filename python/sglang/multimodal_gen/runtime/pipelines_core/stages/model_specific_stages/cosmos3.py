@@ -59,14 +59,19 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.post_training.denoise_loop_observer import (
-    get_denoise_loop_observer,
-)
 from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
     RolloutDenoisingMixin,
 )
+from sglang.multimodal_gen.runtime.post_training.rollout_recorder import (
+    RolloutRecorder,
+    RolloutStreamSpec,
+    legacy_video_trajectory,
+)
 from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
     prepare_rollout_request_scheduler,
+)
+from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
+    SchedulerRLMixin,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -1494,7 +1499,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # Rollout requests carry a per-request scheduler bound by the timestep stage.
         scheduler = batch.scheduler if batch.scheduler is not None else self.scheduler
-        observer = get_denoise_loop_observer(batch)
+        recorder = None
         if batch.rollout:
             if velocity_mask is not None or condition_latents is not None:
                 raise ValueError(
@@ -1506,223 +1511,140 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 raise ValueError(
                     "Cosmos3 rollout does not support action/sound modalities."
                 )
-        observer.init_env(
-            self,
-            batch=batch,
-            pipeline_config=server_args.pipeline_config,
-            image_kwargs={},
-            pos_cond_kwargs={
-                "text_ids": cond_text_ids,
-                "text_mask": cond_text_mask,
-                "fps": fps,
-            },
-            neg_cond_kwargs={
-                "text_ids": uncond_text_ids,
-                "text_mask": uncond_text_mask,
-                "fps": fps,
-            },
-            guidance=None,
-        )
-
-        do_cfg = guidance_scale > 1.0
-        # Control-CFG runs even when text guidance is off (its own extra
-        # control-dropped forward), so it can drive CFG parallel on its own.
-        any_control_cfg = control_latents is not None and control_guidance != 1.0
-
-        enable_cfg_parallel = server_args.enable_cfg_parallel and (
-            do_cfg or any_control_cfg
-        )
-        if action_latents is not None and enable_cfg_parallel:
-            raise NotImplementedError(
-                "Cosmos3 action generation does not support CFG parallel yet"
+        try:
+            if batch.rollout:
+                self._maybe_prepare_rollout(batch)
+                if batch.rollout_return_dit_trajectory:
+                    recorder = RolloutRecorder(
+                        [
+                            RolloutStreamSpec(
+                                name="video",
+                                local_shape=tuple(latents.shape),
+                                timesteps=torch.cat(
+                                    (timesteps, timesteps.new_zeros(1))
+                                ),
+                                sigmas=scheduler.sigmas,
+                            )
+                        ],
+                        retain_steps=batch.rollout_return_step_indices,
+                    )
+            rollout_env = self._snapshot_rollout_environment(
+                batch,
+                image_kwargs={},
+                pos_cond_kwargs={
+                    "text_ids": cond_text_ids,
+                    "text_mask": cond_text_mask,
+                    "fps": fps,
+                },
+                neg_cond_kwargs={
+                    "text_ids": uncond_text_ids,
+                    "text_mask": uncond_text_mask,
+                    "fps": fps,
+                },
+                guidance=None,
             )
 
-        # Use separate scheduler instances for action/sound: UniPC keeps a
-        # per-call output history sized to the last sample, so video (5D),
-        # action (3D), and sound (3D) steps must not share state.
-        sound_scheduler = None
-        if sound_latents is not None:
-            sound_scheduler = copy.deepcopy(self.scheduler)
-            sound_scheduler.set_timesteps(len(timesteps), device=timesteps.device)
-        action_scheduler = None
-        if action_latents is not None:
-            action_scheduler = copy.deepcopy(self.scheduler)
-            action_scheduler.set_timesteps(len(timesteps), device=timesteps.device)
-        cfg_rank = get_classifier_free_guidance_rank() if enable_cfg_parallel else 0
-        cfg_world_size = (
-            get_classifier_free_guidance_world_size() if enable_cfg_parallel else 1
-        )
+            do_cfg = guidance_scale > 1.0
+            # Control-CFG runs even when text guidance is off (its own extra
+            # control-dropped forward), so it can drive CFG parallel on its own.
+            any_control_cfg = control_latents is not None and control_guidance != 1.0
 
-        sp_size = get_sp_world_size()
-        sp_rank = get_sp_parallel_rank() if sp_size > 1 else 0
-        ulysses_enabled = sp_size > 1
-
-        if not self._logged_parallel_config:
-            self._logged_parallel_config = True
-            if enable_cfg_parallel and ulysses_enabled:
-                self.log_info(
-                    f"CFG + Ulysses enabled: cfg_size={cfg_world_size}, cfg_rank={cfg_rank}, "
-                    f"sp_size={sp_size}, sp_rank={sp_rank}"
-                )
-            elif enable_cfg_parallel:
-                self.log_info(
-                    f"CFG parallel enabled: cfg_size={cfg_world_size}, cfg_rank={cfg_rank}"
-                )
-            elif ulysses_enabled:
-                self.log_info(f"Ulysses enabled: sp_size={sp_size}, sp_rank={sp_rank}")
-
-        # Drop any cached UND K/V from a previous request — its text differs.
-        self.transformer.reset_cache()
-
-        self.log_info(
-            f"Starting denoising with {len(timesteps)} steps, CFG={do_cfg}, "
-            f"CFG_parallel={enable_cfg_parallel}, cfg_rank={cfg_rank}"
-        )
-
-        progress_bar = self.progress_bar(
-            enumerate(timesteps),
-            total=len(timesteps),
-            desc="Denoising",
-            batch=batch,
-        )
-
-        for i, t in progress_bar:
-            # Precision is chosen once per step, before any transformer call,
-            # so all CFG branches of the step share the same selection.
-            self.transformer.set_denoising_step(step_index=i, num_steps=len(timesteps))
-            batch_dim = batch.latents.shape[0] if batch.latents is not None else 1
-            timestep = t.unsqueeze(0).expand(batch_dim) if t.dim() == 0 else t
-            # Outside the CFG window the effective scale collapses to 1.0,
-            # which reduces CFG to the cond branch (cfg-parallel safe).
-            effective_scale = (
-                guidance_scale if self._cfg_active_at(t, guidance_interval) else 1.0
+            enable_cfg_parallel = server_args.enable_cfg_parallel and (
+                do_cfg or any_control_cfg
             )
-            # Transfer control-CFG: active only when a control video is present,
-            # ``control_guidance != 1.0``, and the step is inside the (optional)
-            # control window. It needs a second control-dropped forward, so it
-            # owns the prediction for the step and composes text CFG internally.
-            control_cfg_active = (
-                control_latents is not None
-                and control_guidance != 1.0
-                and self._cfg_active_at(t, control_guidance_interval)
+            if action_latents is not None and enable_cfg_parallel:
+                raise NotImplementedError(
+                    "Cosmos3 action generation does not support CFG parallel yet"
+                )
+
+            # Use separate scheduler instances for action/sound: UniPC keeps a
+            # per-call output history sized to the last sample, so video (5D),
+            # action (3D), and sound (3D) steps must not share state.
+            sound_scheduler = None
+            if sound_latents is not None:
+                sound_scheduler = copy.deepcopy(self.scheduler)
+                sound_scheduler.set_timesteps(len(timesteps), device=timesteps.device)
+            action_scheduler = None
+            if action_latents is not None:
+                action_scheduler = copy.deepcopy(self.scheduler)
+                action_scheduler.set_timesteps(len(timesteps), device=timesteps.device)
+            cfg_rank = get_classifier_free_guidance_rank() if enable_cfg_parallel else 0
+            cfg_world_size = (
+                get_classifier_free_guidance_world_size() if enable_cfg_parallel else 1
             )
 
-            if control_cfg_active:
-                # Control-CFG owns the step: 2 branches (text guidance off) or 3
-                # (text guidance on), distributed across CFG ranks and reduced by
-                # ``_predict_noise_cfg`` (sequential per rank, no batching).
-                branches = self._control_cfg_branches(
-                    cond_text_ids,
-                    cond_text_mask,
-                    uncond_text_ids,
-                    uncond_text_mask,
-                    cond_text_seq_len=batch.extra["cond_text_seq_len"],
-                    uncond_text_seq_len=batch.extra["uncond_text_seq_len"],
-                    control_latents=control_latents,
-                    text_guidance_scale=effective_scale,
-                    control_guidance_scale=control_guidance,
-                )
-                noise_pred = self._predict_noise_cfg(
-                    branches,
-                    latents=latents,
-                    timestep=timestep,
-                    video_shape=video_shape,
-                    fps=fps,
-                    cfg_rank=cfg_rank,
-                    cfg_world_size=cfg_world_size,
-                    noisy_frame_mask=velocity_mask,
-                    current_timestep=i,
-                    sound_latents=sound_latents,
-                    action_latents=action_latents,
-                    action_domain_ids=action_domain_ids,
-                    action_noisy_mask=action_velocity_mask,
-                    action_fps=action_fps,
-                    action_start_frame_offset=action_start_frame_offset,
-                )
-            elif do_cfg and effective_scale != 1.0:
-                cond_text_seq_len = batch.extra["cond_text_seq_len"]
-                uncond_text_seq_len = batch.extra["uncond_text_seq_len"]
-                text_seq_lens_differ = cond_text_seq_len != uncond_text_seq_len
-                if (
-                    text_seq_lens_differ
-                    and not self._logged_cfg_split
-                    and not self._current_batch_is_warmup
-                ):
-                    self._logged_cfg_split = True
+            sp_size = get_sp_world_size()
+            sp_rank = get_sp_parallel_rank() if sp_size > 1 else 0
+            ulysses_enabled = sp_size > 1
+
+            if not self._logged_parallel_config:
+                self._logged_parallel_config = True
+                if enable_cfg_parallel and ulysses_enabled:
                     self.log_info(
-                        "Prompt and negative prompt tokenize to different lengths "
-                        f"({cond_text_seq_len} vs {uncond_text_seq_len}); running "
-                        "the CFG branches in separate forwards to keep padding "
-                        "out of the cross-attention"
+                        f"CFG + Ulysses enabled: cfg_size={cfg_world_size}, cfg_rank={cfg_rank}, "
+                        f"sp_size={sp_size}, sp_rank={sp_rank}"
                     )
-                single_cfg_rank_control_free = (
-                    cfg_world_size == 1 and control_latents is None
+                elif enable_cfg_parallel:
+                    self.log_info(
+                        f"CFG parallel enabled: cfg_size={cfg_world_size}, cfg_rank={cfg_rank}"
+                    )
+                elif ulysses_enabled:
+                    self.log_info(
+                        f"Ulysses enabled: sp_size={sp_size}, sp_rank={sp_rank}"
+                    )
+
+            # Drop any cached UND K/V from a previous request — its text differs.
+            self.transformer.reset_cache()
+
+            self.log_info(
+                f"Starting denoising with {len(timesteps)} steps, CFG={do_cfg}, "
+                f"CFG_parallel={enable_cfg_parallel}, cfg_rank={cfg_rank}"
+            )
+
+            progress_bar = self.progress_bar(
+                enumerate(timesteps),
+                total=len(timesteps),
+                desc="Denoising",
+                batch=batch,
+            )
+
+            for i, t in progress_bar:
+                # Precision is chosen once per step, before any transformer call,
+                # so all CFG branches of the step share the same selection.
+                self.transformer.set_denoising_step(
+                    step_index=i, num_steps=len(timesteps)
                 )
-                can_batch_text_cfg = (
-                    single_cfg_rank_control_free and not text_seq_lens_differ
+                batch_dim = batch.latents.shape[0] if batch.latents is not None else 1
+                timestep = t.unsqueeze(0).expand(batch_dim) if t.dim() == 0 else t
+                # Outside the CFG window the effective scale collapses to 1.0,
+                # which reduces CFG to the cond branch (cfg-parallel safe).
+                effective_scale = (
+                    guidance_scale if self._cfg_active_at(t, guidance_interval) else 1.0
                 )
-                if can_batch_text_cfg:
-                    # Single-CFG-rank, control-free text CFG: one batched forward
-                    # (lower launch overhead, no control tokens to duplicate).
-                    noise_pred = self._predict_noise_cfg_batched(
-                        latents=latents,
-                        timestep=timestep,
-                        cond_text_ids=cond_text_ids,
-                        cond_text_mask=cond_text_mask,
-                        uncond_text_ids=uncond_text_ids,
-                        uncond_text_mask=uncond_text_mask,
-                        video_shape=video_shape,
-                        fps=fps,
-                        guidance_scale=effective_scale,
-                        noisy_frame_mask=velocity_mask,
-                        max_text_seq_len=cond_text_seq_len,
-                        current_timestep=i,
-                        sound_latents=sound_latents,
-                        action_latents=action_latents,
-                        action_domain_ids=action_domain_ids,
-                        action_noisy_mask=action_velocity_mask,
-                        action_fps=action_fps,
-                        action_start_frame_offset=action_start_frame_offset,
-                    )
-                elif single_cfg_rank_control_free:
-                    # Keep each branch at its native text length, but preserve the
-                    # canonical CFG operation order used by the batched path. The
-                    # algebraically equivalent coefficient sum rounds differently
-                    # in BF16 and changes deterministic generation results.
-                    noise_pred = self._predict_noise_text_cfg_serial(
-                        latents=latents,
-                        timestep=timestep,
-                        cond_text_ids=cond_text_ids,
-                        cond_text_mask=cond_text_mask,
-                        uncond_text_ids=uncond_text_ids,
-                        uncond_text_mask=uncond_text_mask,
-                        video_shape=video_shape,
-                        fps=fps,
-                        guidance_scale=effective_scale,
-                        noisy_frame_mask=velocity_mask,
-                        cond_text_seq_len=cond_text_seq_len,
-                        uncond_text_seq_len=uncond_text_seq_len,
-                        current_timestep=i,
-                        sound_latents=sound_latents,
-                        action_latents=action_latents,
-                        action_domain_ids=action_domain_ids,
-                        action_noisy_mask=action_velocity_mask,
-                        action_fps=action_fps,
-                        action_start_frame_offset=action_start_frame_offset,
-                    )
-                else:
-                    # CFG parallel or control passthrough: distribute unbatched
-                    # branches across ranks. Separate forwards preserve each
-                    # branch's native text length.
-                    branches = self._text_cfg_branches(
+                # Transfer control-CFG: active only when a control video is present,
+                # ``control_guidance != 1.0``, and the step is inside the (optional)
+                # control window. It needs a second control-dropped forward, so it
+                # owns the prediction for the step and composes text CFG internally.
+                control_cfg_active = (
+                    control_latents is not None
+                    and control_guidance != 1.0
+                    and self._cfg_active_at(t, control_guidance_interval)
+                )
+
+                if control_cfg_active:
+                    # Control-CFG owns the step: 2 branches (text guidance off) or 3
+                    # (text guidance on), distributed across CFG ranks and reduced by
+                    # ``_predict_noise_cfg`` (sequential per rank, no batching).
+                    branches = self._control_cfg_branches(
                         cond_text_ids,
                         cond_text_mask,
                         uncond_text_ids,
                         uncond_text_mask,
-                        guidance_scale=effective_scale,
-                        cond_text_seq_len=cond_text_seq_len,
-                        uncond_text_seq_len=uncond_text_seq_len,
+                        cond_text_seq_len=batch.extra["cond_text_seq_len"],
+                        uncond_text_seq_len=batch.extra["uncond_text_seq_len"],
                         control_latents=control_latents,
+                        text_guidance_scale=effective_scale,
+                        control_guidance_scale=control_guidance,
                     )
                     noise_pred = self._predict_noise_cfg(
                         branches,
@@ -1741,126 +1663,234 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         action_fps=action_fps,
                         action_start_frame_offset=action_start_frame_offset,
                     )
-            else:
-                # No CFG this step (guidance off or outside the CFG window): a
-                # single conditional forward, run identically on every rank.
-                noise_pred = self._run_transformer(
-                    latents=latents,
-                    timestep=timestep,
-                    text_ids=cond_text_ids,
-                    text_mask=cond_text_mask,
-                    video_shape=video_shape,
-                    fps=fps,
-                    cache_key="cond",
-                    noisy_frame_mask=velocity_mask,
-                    max_text_seq_len=batch.extra["cond_text_seq_len"],
-                    current_timestep=i,
-                    sound_latents=sound_latents,
-                    action_latents=action_latents,
-                    action_domain_ids=action_domain_ids,
-                    action_noisy_mask=action_velocity_mask,
-                    action_fps=action_fps,
-                    action_start_frame_offset=action_start_frame_offset,
-                    control_latents=control_latents,
-                )
+                elif do_cfg and effective_scale != 1.0:
+                    cond_text_seq_len = batch.extra["cond_text_seq_len"]
+                    uncond_text_seq_len = batch.extra["uncond_text_seq_len"]
+                    text_seq_lens_differ = cond_text_seq_len != uncond_text_seq_len
+                    if (
+                        text_seq_lens_differ
+                        and not self._logged_cfg_split
+                        and not self._current_batch_is_warmup
+                    ):
+                        self._logged_cfg_split = True
+                        self.log_info(
+                            "Prompt and negative prompt tokenize to different lengths "
+                            f"({cond_text_seq_len} vs {uncond_text_seq_len}); running "
+                            "the CFG branches in separate forwards to keep padding "
+                            "out of the cross-attention"
+                        )
+                    single_cfg_rank_control_free = (
+                        cfg_world_size == 1 and control_latents is None
+                    )
+                    can_batch_text_cfg = (
+                        single_cfg_rank_control_free and not text_seq_lens_differ
+                    )
+                    if can_batch_text_cfg:
+                        # Single-CFG-rank, control-free text CFG: one batched forward
+                        # (lower launch overhead, no control tokens to duplicate).
+                        noise_pred = self._predict_noise_cfg_batched(
+                            latents=latents,
+                            timestep=timestep,
+                            cond_text_ids=cond_text_ids,
+                            cond_text_mask=cond_text_mask,
+                            uncond_text_ids=uncond_text_ids,
+                            uncond_text_mask=uncond_text_mask,
+                            video_shape=video_shape,
+                            fps=fps,
+                            guidance_scale=effective_scale,
+                            noisy_frame_mask=velocity_mask,
+                            max_text_seq_len=cond_text_seq_len,
+                            current_timestep=i,
+                            sound_latents=sound_latents,
+                            action_latents=action_latents,
+                            action_domain_ids=action_domain_ids,
+                            action_noisy_mask=action_velocity_mask,
+                            action_fps=action_fps,
+                            action_start_frame_offset=action_start_frame_offset,
+                        )
+                    elif single_cfg_rank_control_free:
+                        # Keep each branch at its native text length, but preserve the
+                        # canonical CFG operation order used by the batched path. The
+                        # algebraically equivalent coefficient sum rounds differently
+                        # in BF16 and changes deterministic generation results.
+                        noise_pred = self._predict_noise_text_cfg_serial(
+                            latents=latents,
+                            timestep=timestep,
+                            cond_text_ids=cond_text_ids,
+                            cond_text_mask=cond_text_mask,
+                            uncond_text_ids=uncond_text_ids,
+                            uncond_text_mask=uncond_text_mask,
+                            video_shape=video_shape,
+                            fps=fps,
+                            guidance_scale=effective_scale,
+                            noisy_frame_mask=velocity_mask,
+                            cond_text_seq_len=cond_text_seq_len,
+                            uncond_text_seq_len=uncond_text_seq_len,
+                            current_timestep=i,
+                            sound_latents=sound_latents,
+                            action_latents=action_latents,
+                            action_domain_ids=action_domain_ids,
+                            action_noisy_mask=action_velocity_mask,
+                            action_fps=action_fps,
+                            action_start_frame_offset=action_start_frame_offset,
+                        )
+                    else:
+                        # CFG parallel or control passthrough: distribute unbatched
+                        # branches across ranks. Separate forwards preserve each
+                        # branch's native text length.
+                        branches = self._text_cfg_branches(
+                            cond_text_ids,
+                            cond_text_mask,
+                            uncond_text_ids,
+                            uncond_text_mask,
+                            guidance_scale=effective_scale,
+                            cond_text_seq_len=cond_text_seq_len,
+                            uncond_text_seq_len=uncond_text_seq_len,
+                            control_latents=control_latents,
+                        )
+                        noise_pred = self._predict_noise_cfg(
+                            branches,
+                            latents=latents,
+                            timestep=timestep,
+                            video_shape=video_shape,
+                            fps=fps,
+                            cfg_rank=cfg_rank,
+                            cfg_world_size=cfg_world_size,
+                            noisy_frame_mask=velocity_mask,
+                            current_timestep=i,
+                            sound_latents=sound_latents,
+                            action_latents=action_latents,
+                            action_domain_ids=action_domain_ids,
+                            action_noisy_mask=action_velocity_mask,
+                            action_fps=action_fps,
+                            action_start_frame_offset=action_start_frame_offset,
+                        )
+                else:
+                    # No CFG this step (guidance off or outside the CFG window): a
+                    # single conditional forward, run identically on every rank.
+                    noise_pred = self._run_transformer(
+                        latents=latents,
+                        timestep=timestep,
+                        text_ids=cond_text_ids,
+                        text_mask=cond_text_mask,
+                        video_shape=video_shape,
+                        fps=fps,
+                        cache_key="cond",
+                        noisy_frame_mask=velocity_mask,
+                        max_text_seq_len=batch.extra["cond_text_seq_len"],
+                        current_timestep=i,
+                        sound_latents=sound_latents,
+                        action_latents=action_latents,
+                        action_domain_ids=action_domain_ids,
+                        action_noisy_mask=action_velocity_mask,
+                        action_fps=action_fps,
+                        action_start_frame_offset=action_start_frame_offset,
+                        control_latents=control_latents,
+                    )
 
-            # Unpack multi-modality outputs; ordering is (video[, action][, sound]).
-            action_noise_pred = None
-            sound_noise_pred = None
-            if isinstance(noise_pred, tuple):
-                out_idx = 1
-                video_noise_pred = noise_pred[0]
-                if action_latents is not None:
-                    action_noise_pred = noise_pred[out_idx]
-                    out_idx += 1
-                if sound_latents is not None:
-                    sound_noise_pred = noise_pred[out_idx]
-                noise_pred = video_noise_pred
+                # Unpack multi-modality outputs; ordering is (video[, action][, sound]).
+                action_noise_pred = None
+                sound_noise_pred = None
+                if isinstance(noise_pred, tuple):
+                    out_idx = 1
+                    video_noise_pred = noise_pred[0]
+                    if action_latents is not None:
+                        action_noise_pred = noise_pred[out_idx]
+                        out_idx += 1
+                    if sound_latents is not None:
+                        sound_noise_pred = noise_pred[out_idx]
+                    noise_pred = video_noise_pred
 
-            # I2V / V2V: zero-velocity at conditioned frames so the scheduler
-            # keeps them clean; UniPC's predictor-corrector still rescales the
-            # sample, so we re-blend the clean condition latents below.
-            if velocity_mask is not None:
-                noise_pred = noise_pred * velocity_mask
+                # I2V / V2V: zero-velocity at conditioned frames so the scheduler
+                # keeps them clean; UniPC's predictor-corrector still rescales the
+                # sample, so we re-blend the clean condition latents below.
+                if velocity_mask is not None:
+                    noise_pred = noise_pred * velocity_mask
 
-            latents = self.step_latents(
-                batch,
-                latents,
-                t,
-                i,
-                apply=lambda: scheduler.step(
+                if recorder is not None:
+                    recorder.capture_before(i, {"video": latents})
+                step_kwargs = {"batch": batch} if batch.rollout else {}
+                if batch.rollout:
+                    batch._rollout_loop_step_index = i
+                latents = scheduler.step(
                     noise_pred,
                     t,
                     latents,
                     generator=generator,
                     return_dict=False,
-                    batch=batch,
-                )[0],
-            )
-
-            if action_noise_pred is not None:
-                # Zero the velocity at conditioned (clean) action tokens and at
-                # padding dims so the scheduler only denoises the active slots,
-                # then re-blend the clean condition after the step.
-                if action_velocity_mask is not None:
-                    action_noise_pred = action_noise_pred * action_velocity_mask
-                if (
-                    action_raw_dim is not None
-                    and action_raw_dim < action_noise_pred.shape[-1]
-                ):
-                    action_noise_pred[..., action_raw_dim:] = 0.0
-                action_latents = action_scheduler.step(
-                    action_noise_pred,
-                    t,
-                    action_latents,
-                    return_dict=False,
+                    **step_kwargs,
                 )[0]
-                if (
-                    action_condition_latents is not None
-                    and action_velocity_mask is not None
-                ):
-                    action_latents = (
-                        action_velocity_mask * action_latents
-                        + (1.0 - action_velocity_mask) * action_condition_latents
+
+                if action_noise_pred is not None:
+                    # Zero the velocity at conditioned (clean) action tokens and at
+                    # padding dims so the scheduler only denoises the active slots,
+                    # then re-blend the clean condition after the step.
+                    if action_velocity_mask is not None:
+                        action_noise_pred = action_noise_pred * action_velocity_mask
+                    if (
+                        action_raw_dim is not None
+                        and action_raw_dim < action_noise_pred.shape[-1]
+                    ):
+                        action_noise_pred[..., action_raw_dim:] = 0.0
+                    action_latents = action_scheduler.step(
+                        action_noise_pred,
+                        t,
+                        action_latents,
+                        return_dict=False,
+                    )[0]
+                    if (
+                        action_condition_latents is not None
+                        and action_velocity_mask is not None
+                    ):
+                        action_latents = (
+                            action_velocity_mask * action_latents
+                            + (1.0 - action_velocity_mask) * action_condition_latents
+                        )
+
+                if sound_noise_pred is not None:
+                    sound_latents = sound_scheduler.step(
+                        sound_noise_pred,
+                        t,
+                        sound_latents,
+                        return_dict=False,
+                    )[0]
+
+                if condition_latents is not None and velocity_mask is not None:
+                    latents = (
+                        velocity_mask * latents
+                        + (1.0 - velocity_mask) * condition_latents
                     )
 
-            if sound_noise_pred is not None:
-                sound_latents = sound_scheduler.step(
-                    sound_noise_pred,
-                    t,
-                    sound_latents,
-                    return_dict=False,
-                )[0]
+                if batch.profile and not batch.is_warmup:
+                    self.step_profile()
 
-            if condition_latents is not None and velocity_mask is not None:
-                latents = (
-                    velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
-                )
+            if batch.rollout:
+                self._maybe_collect_rollout_log_probs(batch)
+                batch.rollout_trajectory_data.denoising_env = rollout_env
+                if recorder is not None:
+                    streams = recorder.finish({"video": latents})
+                    batch.rollout_trajectory_data.stream_trajectories = streams
+                    batch.rollout_trajectory_data.dit_trajectory = (
+                        legacy_video_trajectory(streams)
+                    )
 
-            if batch.profile and not batch.is_warmup:
-                self.step_profile()
+            # Hygiene only: the set_denoising_step at each loop head is what
+            # actually selects precision, so stale state cannot leak into the
+            # next request's steps.
+            self.transformer.reset_denoising_step()
 
-        observer.finalize(
-            self,
-            batch=batch,
-            latents=latents,
-            num_inference_steps=len(timesteps),
-            final_timestep=timesteps.new_zeros(()).cpu(),
-            server_args=server_args,
-        )
-
-        # Hygiene only: the set_denoising_step at each loop head is what
-        # actually selects precision, so stale state cannot leak into the
-        # next request's steps.
-        self.transformer.reset_denoising_step()
-
-        batch.latents = latents
-        if action_latents is not None:
-            batch.action_latents = action_latents
-        if sound_latents is not None:
-            batch.audio_latents = sound_latents
-        self.log_info("Denoising complete")
-        return batch
+            batch.latents = latents
+            if action_latents is not None:
+                batch.action_latents = action_latents
+            if sound_latents is not None:
+                batch.audio_latents = sound_latents
+            self.log_info("Denoising complete")
+            return batch
+        finally:
+            if recorder is not None:
+                recorder.abort()
+            if batch.rollout and isinstance(scheduler, SchedulerRLMixin):
+                scheduler.release_rollout_resources(batch)
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         if batch.extra.get("transfer_plan") is not None:

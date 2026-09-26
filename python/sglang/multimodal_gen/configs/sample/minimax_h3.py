@@ -240,6 +240,11 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "MiniMax H3 does not support enable_teacache: its packed "
                 "video/audio denoise loop has no lossless TeaCache contract"
             )
+        if self.return_trajectory_latents or self.return_trajectory_decoded:
+            raise ValueError(
+                "MiniMax H3 does not support generic trajectory output; "
+                "use rollout_return_dit_trajectory for joint video/audio rollout state"
+            )
         seeds = self.seed if isinstance(self.seed, list) else [self.seed]
         for seed in seeds:
             if seed > _MINIMAX_H3_MAX_SIGNED_SEED:

@@ -152,11 +152,19 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.post_training.denoise_loop_observer import (
-    get_denoise_loop_observer,
-)
 from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
     RolloutDenoisingMixin,
+)
+from sglang.multimodal_gen.runtime.post_training.rollout_recorder import (
+    RolloutRecorder,
+    RolloutStreamSpec,
+    legacy_video_trajectory,
+)
+from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
+    SchedulerRLMixin,
+)
+from sglang.multimodal_gen.runtime.post_training.sp_utils import (
+    gather_stacked_latents_for_sp,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -278,6 +286,7 @@ class DenoisingContext:
     seq_len: int | None
     guidance: torch.Tensor
     is_warmup: bool
+    rollout_recorder: RolloutRecorder | None = None
     cfg_policy: CFGPolicy | None = None
     trajectory_timesteps: list[torch.Tensor] = field(default_factory=list)
     trajectory_latents: list[torch.Tensor] = field(default_factory=list)
@@ -1279,6 +1288,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if freshly_loaded:
             register_loaded_transformer(self, server_args, pipeline)
 
+        # Preserve the global noise shape before sequence-parallel sharding.
+        if batch.rollout:
+            self._maybe_prepare_rollout(batch)
+
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             scheduler.step,
@@ -1684,22 +1697,16 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if server_args.comfyui_mode:
             batch.noise_pred = noise_pred
 
-        # 5. Advance the scheduler. step_latents records x_t; mixin step records log π.
+        # 5. Advance the scheduler after the loop has captured the joint state.
         with maybe_nvtx_range("scheduler_step", use_nvtx):
             latents_dtype = ctx.latents.dtype
-            latents = self.step_latents(
-                batch,
-                ctx.latents,
-                step.t_host,
-                step.step_index,
-                apply=lambda: ctx.scheduler.step(
-                    model_output=noise_pred,
-                    timestep=step.t_device,
-                    sample=ctx.latents,
-                    **ctx.extra_step_kwargs,
-                    return_dict=False,
-                )[0],
-            )
+            latents = ctx.scheduler.step(
+                model_output=noise_pred,
+                timestep=step.t_device,
+                sample=ctx.latents,
+                **ctx.extra_step_kwargs,
+                return_dict=False,
+            )[0]
             if latents.dtype != latents_dtype and latents.device.type == "mps":
                 latents = latents.to(latents_dtype)
             ctx.latents = latents
@@ -2048,11 +2055,45 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         """
         Run the denoising loop.
         """
-        ctx = self._prepare_denoising_loop(batch, server_args)
-        get_denoise_loop_observer(batch).init_env(
-            self,
-            batch=batch,
-            pipeline_config=server_args.pipeline_config,
+        ctx = None
+        try:
+            ctx = self._prepare_denoising_loop(batch, server_args)
+            return self._denoise_prepared(ctx, batch, server_args)
+        finally:
+            if ctx is not None and ctx.rollout_recorder is not None:
+                ctx.rollout_recorder.abort()
+            if batch.rollout and isinstance(batch.scheduler, SchedulerRLMixin):
+                batch.scheduler.release_rollout_resources(batch)
+
+    def _rollout_state(self, ctx: DenoisingContext) -> dict[str, torch.Tensor]:
+        return {"video": ctx.latents}
+
+    def _rollout_stream_specs(
+        self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
+    ) -> list[RolloutStreamSpec]:
+        start = ctx.scheduler.begin_index or 0
+        return [
+            RolloutStreamSpec(
+                name="video",
+                local_shape=tuple(ctx.latents.shape),
+                timesteps=torch.cat((ctx.timesteps, ctx.timesteps.new_zeros(1))),
+                sigmas=ctx.scheduler.sigmas[start : start + len(ctx.timesteps) + 1],
+                gather=lambda stacked: gather_stacked_latents_for_sp(
+                    server_args.pipeline_config, batch, stacked
+                ),
+            )
+        ]
+
+    def _denoise_prepared(
+        self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
+    ) -> Req:
+        if batch.rollout and batch.rollout_return_dit_trajectory:
+            ctx.rollout_recorder = RolloutRecorder(
+                self._rollout_stream_specs(ctx, batch, server_args),
+                retain_steps=batch.rollout_return_step_indices,
+            )
+        rollout_env = self._snapshot_rollout_environment(
+            batch,
             image_kwargs=ctx.image_kwargs,
             pos_cond_kwargs=ctx.pos_cond_kwargs,
             neg_cond_kwargs=ctx.neg_cond_kwargs,
@@ -2101,6 +2142,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                             t_host,
                             timesteps_cpu,
                         )
+                        if batch.rollout:
+                            batch._rollout_loop_step_index = step_index
+                        if ctx.rollout_recorder is not None:
+                            ctx.rollout_recorder.capture_before(
+                                step_index, self._rollout_state(ctx)
+                            )
                         self._run_denoising_step(ctx, step, batch, server_args)
                         self._record_trajectory(ctx, step, batch, server_args)
 
@@ -2129,14 +2176,15 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # Postprocess must run BEFORE _finalize_denoising_loop so the final
         # scheduler.step output (ctx.latents) is still SP-sharded and can be
         # gathered uniformly alongside the per-step dit_trajectory.
-        get_denoise_loop_observer(batch).finalize(
-            self,
-            batch=batch,
-            latents=ctx.latents,
-            num_inference_steps=num_timesteps,
-            final_timestep=timesteps_cpu.new_zeros(()),
-            server_args=server_args,
-        )
+        if batch.rollout:
+            self._maybe_collect_rollout_log_probs(batch)
+            batch.rollout_trajectory_data.denoising_env = rollout_env
+            if ctx.rollout_recorder is not None:
+                streams = ctx.rollout_recorder.finish(self._rollout_state(ctx))
+                batch.rollout_trajectory_data.stream_trajectories = streams
+                batch.rollout_trajectory_data.dit_trajectory = legacy_video_trajectory(
+                    streams
+                )
         self._finalize_denoising_loop(ctx, batch, server_args)
         return batch
 

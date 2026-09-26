@@ -64,6 +64,23 @@ def _extract_single_sample_tensor(
     return obj
 
 
+def _slice_stream_trajectory(
+    trajectory: RolloutDitTrajectory, sample_idx: int, batch_size: int
+) -> RolloutDitTrajectory:
+    latents = trajectory.latents
+    if latents is not None:
+        if latents.ndim < 3 or latents.shape[0] != batch_size:
+            raise ValueError("Rollout trajectory requires [B, boundaries, ...] layout")
+        latents = latents[sample_idx].contiguous()
+    return RolloutDitTrajectory(
+        latents=latents,
+        timesteps=trajectory.timesteps,
+        sigmas=trajectory.sigmas,
+        latent_step_indices=trajectory.latent_step_indices,
+        model_timesteps=trajectory.model_timesteps,
+    )
+
+
 def _slice_rollout_trajectory_for_sample(
     rtd: RolloutTrajectoryData | None,
     sample_idx: int,
@@ -124,19 +141,24 @@ def _slice_rollout_trajectory_for_sample(
                 else None
             ),
         )
+        if env.sample_layout == "single_packed":
+            if batch_size != 1:
+                raise ValueError("Packed rollout conditioning requires a single sample")
+            denoising_env = env
     dit_trajectory = None
     if rtd.dit_trajectory:
-        dit = rtd.dit_trajectory
-        dit_trajectory = RolloutDitTrajectory(
-            latents=_extract_single_sample_tensor(dit.latents, sample_idx, batch_size),
-            timesteps=dit.timesteps,
-            sigmas=dit.sigmas,
+        dit_trajectory = _slice_stream_trajectory(
+            rtd.dit_trajectory, sample_idx, batch_size
         )
     return RolloutTrajectoryData(
         rollout_log_probs=log_probs,
         rollout_debug_tensors=debug_tensors,
         denoising_env=denoising_env,
         dit_trajectory=dit_trajectory,
+        stream_trajectories={
+            name: _slice_stream_trajectory(trajectory, sample_idx, batch_size)
+            for name, trajectory in rtd.stream_trajectories.items()
+        },
     )
 
 
@@ -163,6 +185,7 @@ def _serialize_rollout_trajectory(
     if rtd.denoising_env:
         env = rtd.denoising_env
         serialized_denoising_env = {
+            "sample_layout": env.sample_layout,
             "image_kwargs": (
                 _maybe_serialize(env.image_kwargs) if env.image_kwargs else None
             ),
@@ -185,6 +208,8 @@ def _serialize_rollout_trajectory(
             ),
             "timesteps": serialized_dit_timesteps,
             "sigmas": serialized_dit_sigmas,
+            "latent_step_indices": _maybe_serialize(dit.latent_step_indices),
+            "model_timesteps": _maybe_serialize(dit.model_timesteps),
         }
     return (
         serialized_log_probs,
@@ -264,6 +289,19 @@ def _build_response(
                 rollout_debug_tensors=serialized_debug_tensors,
                 denoising_env=serialized_denoising_env,
                 dit_trajectory=serialized_dit_trajectory,
+                stream_trajectories={
+                    name: {
+                        "latents": _maybe_serialize(trajectory.latents),
+                        "timesteps": _maybe_serialize(trajectory.timesteps),
+                        "sigmas": _maybe_serialize(trajectory.sigmas),
+                        "latent_step_indices": _maybe_serialize(
+                            trajectory.latent_step_indices
+                        ),
+                        "model_timesteps": _maybe_serialize(trajectory.model_timesteps),
+                    }
+                    for name, trajectory in per_sample_trajectory.stream_trajectories.items()
+                }
+                or None,
                 inference_time_s=inference_time_s,
                 peak_memory_mb=peak_memory_mb,
             )

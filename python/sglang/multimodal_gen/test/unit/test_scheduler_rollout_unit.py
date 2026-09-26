@@ -395,10 +395,6 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
         injection (excluded steps = ODE transition + zero log-prob); independently,
         rollout_return_step_indices gates the dit_trajectory append. Both features
         are exercised here because they share the same step_index predicate."""
-        from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
-            RolloutDenoisingMixin,
-        )
-
         # --- Part 1: rollout_sde_step_indices gates SDE noise injection ---
         scheduler = _DummyScheduler()
         shape = (1, 4, 8, 8)
@@ -476,106 +472,8 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
         # consume_local_rollout_log_probs stacking stays consistent.
         self.assertTrue(torch.all(elem_count > 0))
 
-        # --- Part 2: rollout_return_step_indices gates dit trajectory append ---
-        class _DummyDit(RolloutDenoisingMixin):
-            pass
-
-        dit = _DummyDit()
-        lat = torch.zeros(1, 4, 8, 8)
-        ts = torch.tensor(0.5)
-
-        # Filter [0, 2] over steps 0,1,2 → steps 0 and 2 appended, step 1 skipped.
-        traj_filtered = types.SimpleNamespace(
-            rollout=True,
-            rollout_return_dit_trajectory=True,
-            rollout_return_step_indices=[0, 2],
-            _rollout_denoising_env_state={"step_latents": [], "step_timesteps": []},
-        )
-        for i in range(3):
-            dit._maybe_append_dit_trajectory_step(
-                batch=traj_filtered,
-                latents=lat,
-                timestep_value=ts,
-                step_index=i,
-            )
-        self.assertEqual(
-            len(traj_filtered._rollout_denoising_env_state["step_latents"]), 2
-        )
-        self.assertEqual(
-            len(traj_filtered._rollout_denoising_env_state["step_timesteps"]), 2
-        )
-
-        # None (default) → all steps appended (back-compat).
-        traj_all = types.SimpleNamespace(
-            rollout=True,
-            rollout_return_dit_trajectory=True,
-            rollout_return_step_indices=None,
-            _rollout_denoising_env_state={"step_latents": [], "step_timesteps": []},
-        )
-        for i in range(3):
-            dit._maybe_append_dit_trajectory_step(
-                batch=traj_all,
-                latents=lat,
-                timestep_value=ts,
-                step_index=i,
-            )
-        self.assertEqual(len(traj_all._rollout_denoising_env_state["step_latents"]), 3)
-
-        # Filter excludes step_index=T (the final/(T+1)-th latent appended by
-        # _postprocess_rollout_outputs). Simulate T=3 loop steps + final append.
-        traj_exclude_final = types.SimpleNamespace(
-            rollout=True,
-            rollout_return_dit_trajectory=True,
-            rollout_return_step_indices=[0, 1, 2],  # excludes T=3
-            _rollout_denoising_env_state={"step_latents": [], "step_timesteps": []},
-        )
-        for i in range(3):
-            dit._maybe_append_dit_trajectory_step(
-                batch=traj_exclude_final,
-                latents=lat,
-                timestep_value=ts,
-                step_index=i,
-            )
-        # Mimic the final append routed through the same filter.
-        dit._maybe_append_dit_trajectory_step(
-            batch=traj_exclude_final,
-            latents=lat,
-            timestep_value=torch.zeros(()),
-            step_index=3,
-        )
-        self.assertEqual(
-            len(traj_exclude_final._rollout_denoising_env_state["step_latents"]), 3
-        )
-        self.assertEqual(
-            len(traj_exclude_final._rollout_denoising_env_state["step_timesteps"]), 3
-        )
-
-        # Filter includes only step_index=T → only the final latent survives.
-        traj_only_final = types.SimpleNamespace(
-            rollout=True,
-            rollout_return_dit_trajectory=True,
-            rollout_return_step_indices=[3],
-            _rollout_denoising_env_state={"step_latents": [], "step_timesteps": []},
-        )
-        for i in range(3):
-            dit._maybe_append_dit_trajectory_step(
-                batch=traj_only_final,
-                latents=lat,
-                timestep_value=ts,
-                step_index=i,
-            )
-        dit._maybe_append_dit_trajectory_step(
-            batch=traj_only_final,
-            latents=lat,
-            timestep_value=torch.zeros(()),
-            step_index=3,
-        )
-        self.assertEqual(
-            len(traj_only_final._rollout_denoising_env_state["step_latents"]), 1
-        )
-        self.assertEqual(
-            len(traj_only_final._rollout_denoising_env_state["step_timesteps"]), 1
-        )
+        # Sparse trajectory retention is exercised independently with the
+        # stream recorder in test_rollout_recorder.py.
 
 
 if __name__ == "__main__":
