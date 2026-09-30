@@ -28,6 +28,8 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
 )
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutCollectionState,
+    RolloutSessionData,
     RolloutTrajectoryData,
 )
 from sglang.multimodal_gen.runtime.realtime.session import (
@@ -194,6 +196,9 @@ class Req:
     trajectory_timesteps: torch.Tensor | None = None
     trajectory_latents: torch.Tensor | None = None
     rollout_trajectory_data: RolloutTrajectoryData | None = None
+    _rollout_denoising_env_state: RolloutCollectionState | None = None
+    _rollout_session_data: RolloutSessionData | None = None
+    _rollout_loop_step_index: int | None = None
     trajectory_audio_latents: torch.Tensor | None = None
 
     # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)

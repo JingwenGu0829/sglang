@@ -1280,6 +1280,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if freshly_loaded:
             register_loaded_transformer(self, server_args, pipeline)
 
+        # Noise is drawn in global coordinates before SP sharding below.
+        if batch.rollout:
+            self._maybe_prepare_rollout(batch)
+
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             scheduler.step,
@@ -2038,7 +2042,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        with self._offload_for_torch_compile_warmup(batch):
+        with (
+            self.rollout_lifecycle(batch),
+            self._offload_for_torch_compile_warmup(batch),
+        ):
             return self._denoise(batch, server_args)
 
     @torch.no_grad()

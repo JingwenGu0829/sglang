@@ -2,7 +2,7 @@
 """RL-specific dataclasses used by post-training and rollout paths."""
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -16,7 +16,7 @@ class RolloutSessionData:
 
     pipeline_config: Any = None
     sigma_max: float = 0.0
-    latents_shape: tuple | None = None
+    latents_shape: tuple | None = None  # Global [B, ...], before SP sharding.
     noise_buffer: torch.Tensor | None = None
 
     local_log_prob_sum: list[torch.Tensor] = field(default_factory=list)
@@ -40,24 +40,44 @@ class RolloutDebugTensors:
 
 @dataclass
 class RolloutDenoisingEnv:
+    """Owned CPU copies of static conditioning at loop entry.
+
+    Dynamic joint-model inputs (such as the evolving audio state) are not static
+    conditioning and are not captured by this video-only contract.
+    """
+
     image_kwargs: dict[str, Any] | None = None
     pos_cond_kwargs: dict[str, Any] | None = None
     neg_cond_kwargs: dict[str, Any] | None = None
     guidance: torch.Tensor | None = None
+    # Packed H3 conditioning describes one sample; leading axes are token axes.
+    sample_layout: Literal["batched", "single_packed"] = "batched"
+
+
+@dataclass
+class RolloutCollectionState:
+    """Owned video snapshots for one denoising loop, cleared on finish or error."""
+
+    sigmas: torch.Tensor  # Full scheduler grid, copied at loop entry.
+    env: RolloutDenoisingEnv | None = None
+    step_latents: list[torch.Tensor] = field(default_factory=list)
+    step_timesteps: list[torch.Tensor] = field(default_factory=list)
 
 
 @dataclass
 class RolloutDitTrajectory:
-    # [B, T+1, ...]: per-step noisy latents x_{t_0..t_{T-1}} followed by the
-    # final denoised latent x_{t_T} (last scheduler.step output).
+    # [B, K, ...]: owned pre-update states plus the optional final state.
+    # K=T+1 for full capture; sparse capture retains selected loop boundaries.
+    # Packed H3 rows still carry an explicit B=1 axis.
     latents: torch.Tensor | None = None
-    timesteps: torch.Tensor | None = None  # [T]
+    timesteps: torch.Tensor | None = None  # [K], aligned with retained latents.
     # [T+1] scheduler.sigmas snapshot (post-shift, includes terminal 0).
     sigmas: torch.Tensor | None = None
 
 
 @dataclass
 class RolloutTrajectoryData:
+    # [B, T] transition scores; sparse trajectory selection does not filter these.
     rollout_log_probs: torch.Tensor | None = None
     rollout_debug_tensors: RolloutDebugTensors | None = None
     denoising_env: RolloutDenoisingEnv | None = None

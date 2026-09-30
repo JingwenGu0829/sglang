@@ -216,10 +216,6 @@ def test_h3_negated_v_ode_matches_native_euler():
     from types import SimpleNamespace
 
     import sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin as rl_mixin_module
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
-        MiniMaxH3DenoisingStage,
-        _prepare_h3_rollout_session,
-    )
     from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
         SchedulerRLMixin,
     )
@@ -260,7 +256,9 @@ def test_h3_negated_v_ode_matches_native_euler():
     )
     sample = state.unsqueeze(0)
     with patch.object(rl_mixin_module, "get_sp_world_size", return_value=1):
-        _prepare_h3_rollout_session(batch, tuple(sample.shape), SimpleNamespace())
+        scheduler.prepare_rollout(
+            batch, SimpleNamespace(), latents_shape=tuple(sample.shape)
+        )
         updated = batch.scheduler.flow_sde_sampling(
             batch,
             mapped.unsqueeze(0),
@@ -270,6 +268,126 @@ def test_h3_negated_v_ode_matches_native_euler():
             batch.generator,
         )
     torch.testing.assert_close(updated.squeeze(0), expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("method", ["ode", "sde", "cps"])
+def test_h3_stage_exports_owned_batched_video_rollout(method, monkeypatch):
+    from contextlib import nullcontext
+
+    from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+        _slice_rollout_trajectory_for_sample,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (
+        denoising as h3,
+    )
+
+    branch = _branch("t2va")
+    packed = minimax_h3_packed_sequence(
+        text_len=3,
+        latent_t=2,
+        latent_h=4,
+        latent_w=4,
+        audio_t=3,
+        include_keyframe_cond=False,
+    )
+    video = torch.zeros(branch.img_pos.numel(), 96)
+    audio = torch.zeros(branch.audio_pos.numel(), 32)
+    ctx = SimpleNamespace(
+        sigmas={"video": [1.0, 0.7, 0.3, 0.0], "audio": [1.0, 0.8, 0.2, 0.0]},
+        embeddings={
+            "positive": {
+                "hidden_states": torch.zeros(3, 5120),
+                "text_token_tags": torch.zeros(3),
+            }
+        },
+        cond_rows=None,
+        audio_ref_rows=None,
+    )
+    config = SimpleNamespace(
+        uses_subblock_attention=lambda _: False,
+        gather_denoising_env_static_for_sp=lambda batch, cond: cond,
+        shard_latents_for_sp=lambda batch, latents: (latents, False),
+    )
+    stage = h3.MiniMaxH3DenoisingStage.__new__(h3.MiniMaxH3DenoisingStage)
+    stage.server_args = SimpleNamespace(pipeline_config=config)
+    stage.transformer = SimpleNamespace(prepare_adaln_plans=lambda _: None)
+    stage._component_residency_manager = None
+    stage._current_use_nvtx = False
+    stage._maybe_enable_cache_dit_and_torch_compile = lambda *args: None
+    stage._finish_active_component_use = lambda: None
+    stage._profile_denoising_step = lambda *args, **kwargs: nullcontext()
+    stage.progress_bar = lambda **kwargs: nullcontext(
+        SimpleNamespace(update=lambda: None)
+    )
+    stage._forward_dit = lambda *args, **kwargs: (
+        torch.ones_like(video),
+        torch.ones_like(audio),
+    )
+    published = {}
+    for name, replacement in {
+        "_resolve_full_loop_context": lambda _: ctx,
+        "_assemble_condition_rows": lambda _: None,
+        "_build_packed_layout": lambda *args, **kwargs: packed,
+        "minimax_h3_condition_noise_aug": lambda _: (0.0, 0.0),
+        "_apply_condition_noise_aug": lambda *args, **kwargs: None,
+        "_build_cube_attn_metadata": lambda *args, **kwargs: None,
+        "_resolve_denoise_model": lambda *args, **kwargs: stage.transformer,
+        "_maybe_prepare_vsa_h3_step_metadata": lambda **kwargs: lambda *args: None,
+        "_precompute_refined_prompt_embeds": lambda *args, **kwargs: None,
+        "_precompute_rope_cache": lambda *args, **kwargs: None,
+        "_expand_initial_rows": lambda *args: (video.clone(), audio.clone()),
+        "_publish_full_loop_outputs": lambda *args, **kwargs: published.update(kwargs),
+    }.items():
+        monkeypatch.setattr(h3, name, replacement)
+    for module in ("scheduler_rl_mixin", "sp_utils"):
+        monkeypatch.setattr(
+            f"sglang.multimodal_gen.runtime.post_training.{module}.get_sp_world_size",
+            lambda: 1,
+        )
+    monkeypatch.setattr(
+        h3,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: False,
+            is_cpu=lambda: True,
+            get_local_torch_device=lambda: torch.device("cpu"),
+        ),
+    )
+    batch = SimpleNamespace(
+        scheduler=None,
+        latents=None,
+        generator=torch.Generator().manual_seed(17),
+        rollout=True,
+        rollout_sde_type=method,
+        rollout_noise_level=0.5,
+        rollout_log_prob_no_const=True,
+        rollout_debug_mode=False,
+        rollout_return_dit_trajectory=True,
+        rollout_return_denoising_env=True,
+        rollout_return_step_indices=[0, 2, 3],
+        rollout_trajectory_data=None,
+        sampling_params=None,
+        is_warmup=True,
+    )
+    with stage.rollout_lifecycle(batch):
+        stage._run_full_loop(batch, stage.server_args)
+    result = batch.rollout_trajectory_data
+    assert batch.scheduler is None
+    assert batch._rollout_session_data is None
+    assert result.rollout_log_probs.shape == (1, 3)
+    assert result.dit_trajectory.latents.shape == (1, 3, *video.shape)
+    assert result.dit_trajectory.timesteps.tolist() == [1000.0, 300.0, 0.0]
+    assert (result.dit_trajectory.latents[:, 0] == 0).all()
+    assert not torch.equal(
+        result.dit_trajectory.latents[:, 0], result.dit_trajectory.latents[:, -1]
+    )
+    torch.testing.assert_close(
+        result.dit_trajectory.latents[0, -1], published["video_rows"]
+    )
+    torch.testing.assert_close(published["audio_rows"], torch.ones_like(audio))
+    result.denoising_env.pos_cond_kwargs["one_token"] = torch.ones(1, 8)
+    sliced = _slice_rollout_trajectory_for_sample(result, 0, 1)
+    assert sliced.denoising_env.pos_cond_kwargs["one_token"].shape == (1, 8)
 
 
 def test_cube_metadata_builder_uses_packed_layout_and_validates_step_count():

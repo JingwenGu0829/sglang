@@ -9,7 +9,7 @@ rows stay pinned to their noised step-0 anchors.
 from __future__ import annotations
 
 from contextlib import AbstractContextManager, nullcontext
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 import torch
 
@@ -35,6 +35,27 @@ MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
 MINIMAX_H3_VIDEO_ROW_WIDTH = 96
 MINIMAX_H3_AUDIO_ROW_WIDTH = 32
 _MINIMAX_H3_SUBBLOCK_QUERY_BLOCK_SIZE = 64
+
+
+class H3StepUpdate(Protocol):
+    """Advance both target-row tensors in place at one joint boundary.
+
+    Inputs are borrowed views. Capture must clone them before either update.
+    Native callbacks mutate their corresponding state and velocity buffers;
+    an adapter may replace an update but must advance both streams exactly once.
+    """
+
+    def __call__(
+        self,
+        step: int,
+        video: torch.Tensor,
+        video_velocity: torch.Tensor,
+        audio: torch.Tensor,
+        audio_velocity: torch.Tensor,
+        update_video: Callable[[], None],
+        update_audio: Callable[[], None],
+        /,
+    ) -> None: ...
 
 
 def _minimax_h3_subblock_video_query_indices(
@@ -461,7 +482,7 @@ def minimax_h3_denoise_loop(
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     attn_metadata: AttentionMetadata | None = None,
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
-    apply_step: Callable[..., None] | None = None,
+    apply_step: H3StepUpdate | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).

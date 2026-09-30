@@ -6,12 +6,13 @@ Moved out of DenoisingStage to keep the core stage lean.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutCollectionState,
     RolloutDenoisingEnv,
     RolloutDitTrajectory,
     RolloutTrajectoryData,
@@ -25,21 +26,9 @@ from sglang.multimodal_gen.runtime.post_training.sp_utils import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
-def _trajectory_sigmas(batch: Req) -> torch.Tensor | None:
-    scheduler = getattr(batch, "scheduler", None)
-    sigmas = getattr(scheduler, "sigmas", None) if scheduler is not None else None
-    if sigmas is None:
-        sigmas = getattr(batch, "sigmas", None)
-    if isinstance(sigmas, torch.Tensor):
-        return sigmas.detach().cpu().clone()
-    if isinstance(sigmas, (list, tuple)):
-        return torch.tensor(sigmas, dtype=torch.float32)
-    return None
-
-
 def _kwargs_to_cpu(d: Any) -> Any:
     if isinstance(d, torch.Tensor):
-        return d.detach().cpu()
+        return d.detach().cpu().clone()
     if isinstance(d, dict):
         return {k: _kwargs_to_cpu(v) for k, v in d.items()}
     if isinstance(d, list):
@@ -49,7 +38,20 @@ def _kwargs_to_cpu(d: Any) -> Any:
     return d
 
 
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
+
 class RolloutDenoisingMixin:
+    @contextmanager
+    def rollout_lifecycle(self, batch: Req):
+        """Scope request-owned collection state; cleanup never performs collectives."""
+        try:
+            yield
+        finally:
+            if batch.rollout:
+                batch._rollout_denoising_env_state = None
+                batch._rollout_session_data = None
 
     def step_latents(
         self,
@@ -65,7 +67,8 @@ class RolloutDenoisingMixin:
         in-place Euler that returns ``None``. ``log π`` still comes from
         ``SchedulerRLMixin`` inside ``scheduler.step``.
         """
-        batch._rollout_loop_step_index = step_index
+        if batch.rollout:
+            batch._rollout_loop_step_index = step_index
         self._maybe_append_dit_trajectory_step(
             batch=batch,
             latents=latents,
@@ -75,7 +78,7 @@ class RolloutDenoisingMixin:
         updated = apply()
         return latents if updated is None else updated
 
-    def _maybe_prepare_rollout(self, batch: Req):
+    def _maybe_prepare_rollout(self, batch: Req, *, latents_shape: tuple | None = None):
         """Prepare denoising loop for rollout."""
         scheduler = batch.scheduler
         if not isinstance(scheduler, SchedulerRLMixin):
@@ -90,6 +93,7 @@ class RolloutDenoisingMixin:
             scheduler.prepare_rollout(
                 batch=batch,
                 pipeline_config=self.server_args.pipeline_config,
+                latents_shape=latents_shape,
             )
 
     def _maybe_collect_rollout_log_probs(self, batch: Req):
@@ -150,6 +154,7 @@ class RolloutDenoisingMixin:
         pos_cond_kwargs: dict[str, Any],
         neg_cond_kwargs: dict[str, Any],
         guidance: torch.Tensor | None,
+        sample_layout: Literal["batched", "single_packed"] = "batched",
     ) -> None:
         collect_env = batch.rollout_return_denoising_env
         collect_traj = batch.rollout_return_dit_trajectory
@@ -160,26 +165,29 @@ class RolloutDenoisingMixin:
         if collect_env:
             env = RolloutDenoisingEnv(
                 image_kwargs=_kwargs_to_cpu(image_kwargs),
-                pos_cond_kwargs=_kwargs_to_cpu(pos_cond_kwargs),
-                neg_cond_kwargs=(
-                    _kwargs_to_cpu(neg_cond_kwargs) if neg_cond_kwargs else None
+                pos_cond_kwargs=_kwargs_to_cpu(
+                    pipeline_config.gather_denoising_env_static_for_sp(
+                        batch, pos_cond_kwargs
+                    )
                 ),
-                guidance=guidance.detach().cpu() if guidance is not None else None,
+                neg_cond_kwargs=(
+                    _kwargs_to_cpu(
+                        pipeline_config.gather_denoising_env_static_for_sp(
+                            batch, neg_cond_kwargs
+                        )
+                    )
+                    if neg_cond_kwargs
+                    else None
+                ),
+                guidance=_kwargs_to_cpu(guidance),
+                sample_layout=sample_layout,
             )
-            pos_src = pos_cond_kwargs
-            neg_src = neg_cond_kwargs
         else:
             env = None
-            pos_src = None
-            neg_src = None
 
-        batch._rollout_denoising_env_state = {
-            "env": env,
-            "step_latents": [],
-            "step_timesteps": [],
-            "pos_cond_kwargs_src": pos_src,
-            "neg_cond_kwargs_src": neg_src,
-        }
+        batch._rollout_denoising_env_state = RolloutCollectionState(
+            sigmas=batch.scheduler.sigmas.detach().cpu().clone(), env=env
+        )
 
     def _maybe_append_dit_trajectory_step(
         self,
@@ -190,25 +198,29 @@ class RolloutDenoisingMixin:
     ) -> None:
         if not batch.rollout or not batch.rollout_return_dit_trajectory:
             return
-        state = getattr(batch, "_rollout_denoising_env_state", None)
+        state = batch._rollout_denoising_env_state
         if state is None:
             return
 
-        return_step_indices = getattr(batch, "rollout_return_step_indices", None)
+        return_step_indices = batch.rollout_return_step_indices
         if return_step_indices is not None and step_index not in return_step_indices:
             return
 
-        state["step_latents"].append(latents.detach())
-        state["step_timesteps"].append(timestep_value.detach().cpu())
+        if latents.ndim < 2:
+            raise ValueError("Rollout latents require an explicit [B, ...] shape")
+        if state.step_latents and state.step_latents[0].shape != latents.shape:
+            raise ValueError("Rollout latent shape changed within a denoising loop")
+        state.step_latents.append(latents.detach().clone())
+        state.step_timesteps.append(timestep_value.detach().cpu().clone())
 
     def _maybe_finalize_denoising_env_collection(self, batch, pipeline_config) -> None:
-        state = getattr(batch, "_rollout_denoising_env_state", None)
+        state = batch._rollout_denoising_env_state
         if state is None:
             return
 
-        env: RolloutDenoisingEnv | None = state["env"]
-        step_latents: list[torch.Tensor] = state["step_latents"]
-        step_timesteps: list[torch.Tensor] = state["step_timesteps"]
+        env = state.env
+        step_latents = state.step_latents
+        step_timesteps = state.step_timesteps
 
         if batch.rollout_trajectory_data is None:
             batch.rollout_trajectory_data = RolloutTrajectoryData()
@@ -223,24 +235,10 @@ class RolloutDenoisingMixin:
             batch.rollout_trajectory_data.dit_trajectory = RolloutDitTrajectory(
                 latents=step_latents_tensor.cpu(),
                 timesteps=torch.stack(step_timesteps, dim=0).cpu(),
-                sigmas=_trajectory_sigmas(batch),
+                sigmas=state.sigmas,
             )
 
         if env is not None and batch.rollout_return_denoising_env:
-            gather_fn = getattr(
-                pipeline_config, "gather_denoising_env_static_for_sp", None
-            )
-
-            pos_src = state.get("pos_cond_kwargs_src")
-            if pos_src is not None and env.pos_cond_kwargs is not None:
-                gathered_pos = gather_fn(batch, pos_src) if gather_fn else pos_src
-                env.pos_cond_kwargs = _kwargs_to_cpu(gathered_pos)
-
-            neg_src = state.get("neg_cond_kwargs_src")
-            if neg_src is not None and env.neg_cond_kwargs is not None:
-                gathered_neg = gather_fn(batch, neg_src) if gather_fn else neg_src
-                env.neg_cond_kwargs = _kwargs_to_cpu(gathered_neg)
-
             batch.rollout_trajectory_data.denoising_env = env
 
         batch._rollout_denoising_env_state = None

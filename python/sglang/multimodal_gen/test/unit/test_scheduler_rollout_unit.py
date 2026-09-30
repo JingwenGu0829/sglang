@@ -5,6 +5,9 @@ import unittest
 import torch
 
 import sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin as rl_mixin_module
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutCollectionState,
+)
 from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
     SchedulerRLMixin,
 )
@@ -489,7 +492,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
             rollout=True,
             rollout_return_dit_trajectory=True,
             rollout_return_step_indices=[0, 2],
-            _rollout_denoising_env_state={"step_latents": [], "step_timesteps": []},
+            _rollout_denoising_env_state=RolloutCollectionState(sigmas=torch.empty(0)),
         )
         for i in range(3):
             dit._maybe_append_dit_trajectory_step(
@@ -499,10 +502,10 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                 step_index=i,
             )
         self.assertEqual(
-            len(traj_filtered._rollout_denoising_env_state["step_latents"]), 2
+            len(traj_filtered._rollout_denoising_env_state.step_latents), 2
         )
         self.assertEqual(
-            len(traj_filtered._rollout_denoising_env_state["step_timesteps"]), 2
+            len(traj_filtered._rollout_denoising_env_state.step_timesteps), 2
         )
 
         # None (default) → all steps appended (back-compat).
@@ -510,7 +513,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
             rollout=True,
             rollout_return_dit_trajectory=True,
             rollout_return_step_indices=None,
-            _rollout_denoising_env_state={"step_latents": [], "step_timesteps": []},
+            _rollout_denoising_env_state=RolloutCollectionState(sigmas=torch.empty(0)),
         )
         for i in range(3):
             dit._maybe_append_dit_trajectory_step(
@@ -519,7 +522,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                 timestep_value=ts,
                 step_index=i,
             )
-        self.assertEqual(len(traj_all._rollout_denoising_env_state["step_latents"]), 3)
+        self.assertEqual(len(traj_all._rollout_denoising_env_state.step_latents), 3)
 
         # Filter excludes step_index=T (the final/(T+1)-th latent appended by
         # _postprocess_rollout_outputs). Simulate T=3 loop steps + final append.
@@ -527,7 +530,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
             rollout=True,
             rollout_return_dit_trajectory=True,
             rollout_return_step_indices=[0, 1, 2],  # excludes T=3
-            _rollout_denoising_env_state={"step_latents": [], "step_timesteps": []},
+            _rollout_denoising_env_state=RolloutCollectionState(sigmas=torch.empty(0)),
         )
         for i in range(3):
             dit._maybe_append_dit_trajectory_step(
@@ -544,10 +547,10 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
             step_index=3,
         )
         self.assertEqual(
-            len(traj_exclude_final._rollout_denoising_env_state["step_latents"]), 3
+            len(traj_exclude_final._rollout_denoising_env_state.step_latents), 3
         )
         self.assertEqual(
-            len(traj_exclude_final._rollout_denoising_env_state["step_timesteps"]), 3
+            len(traj_exclude_final._rollout_denoising_env_state.step_timesteps), 3
         )
 
         # Filter includes only step_index=T → only the final latent survives.
@@ -555,7 +558,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
             rollout=True,
             rollout_return_dit_trajectory=True,
             rollout_return_step_indices=[3],
-            _rollout_denoising_env_state={"step_latents": [], "step_timesteps": []},
+            _rollout_denoising_env_state=RolloutCollectionState(sigmas=torch.empty(0)),
         )
         for i in range(3):
             dit._maybe_append_dit_trajectory_step(
@@ -571,10 +574,10 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
             step_index=3,
         )
         self.assertEqual(
-            len(traj_only_final._rollout_denoising_env_state["step_latents"]), 1
+            len(traj_only_final._rollout_denoising_env_state.step_latents), 1
         )
         self.assertEqual(
-            len(traj_only_final._rollout_denoising_env_state["step_timesteps"]), 1
+            len(traj_only_final._rollout_denoising_env_state.step_timesteps), 1
         )
 
 

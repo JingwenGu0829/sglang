@@ -1794,7 +1794,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     latents,
                     generator=generator,
                     return_dict=False,
-                    batch=batch,
+                    **({"batch": batch} if batch.rollout else {}),
                 )[0],
             )
 
@@ -1863,14 +1863,15 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         return batch
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        if batch.extra.get("transfer_plan") is not None:
-            return self._forward_transfer(batch, server_args)
-        with self.use_declared_component(
-            component_name="transformer",
-            module=self.transformer,
-            phase="denoise",
-        ):
-            return self._denoise_once(batch, server_args)
+        with self.rollout_lifecycle(batch):
+            if batch.extra.get("transfer_plan") is not None:
+                return self._forward_transfer(batch, server_args)
+            with self.use_declared_component(
+                component_name="transformer",
+                module=self.transformer,
+                phase="denoise",
+            ):
+                return self._denoise_once(batch, server_args)
 
     def _predict_noise_cfg(
         self,
