@@ -2,7 +2,7 @@
 """RL-specific dataclasses used by post-training and rollout paths."""
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -44,6 +44,8 @@ class RolloutDenoisingEnv:
     pos_cond_kwargs: dict[str, Any] | None = None
     neg_cond_kwargs: dict[str, Any] | None = None
     guidance: torch.Tensor | None = None
+    # H3's tensors describe one packed sample; leading axes are token axes.
+    sample_layout: Literal["batched", "single_packed"] = "batched"
 
 
 @dataclass

@@ -64,6 +64,23 @@ def _extract_single_sample_tensor(
     return obj
 
 
+def _slice_stream_trajectory(
+    trajectory: RolloutDitTrajectory, sample_idx: int, batch_size: int
+) -> RolloutDitTrajectory:
+    latents = trajectory.latents
+    if latents is not None:
+        if latents.ndim < 3 or latents.shape[0] != batch_size:
+            raise ValueError("Rollout trajectory requires [B, boundaries, ...] layout")
+        latents = latents[sample_idx].contiguous()
+    return RolloutDitTrajectory(
+        latents=latents,
+        timesteps=trajectory.timesteps,
+        sigmas=trajectory.sigmas,
+        latent_step_indices=trajectory.latent_step_indices,
+        model_timesteps=trajectory.model_timesteps,
+    )
+
+
 def _slice_rollout_trajectory_for_sample(
     rtd: RolloutTrajectoryData | None,
     sample_idx: int,
@@ -124,13 +141,14 @@ def _slice_rollout_trajectory_for_sample(
                 else None
             ),
         )
+        if env.sample_layout == "single_packed":
+            if batch_size != 1:
+                raise ValueError("Packed rollout conditioning requires a single sample")
+            denoising_env = env
     dit_trajectory = None
     if rtd.dit_trajectory:
-        dit = rtd.dit_trajectory
-        dit_trajectory = RolloutDitTrajectory(
-            latents=_extract_single_sample_tensor(dit.latents, sample_idx, batch_size),
-            timesteps=dit.timesteps,
-            sigmas=dit.sigmas,
+        dit_trajectory = _slice_stream_trajectory(
+            rtd.dit_trajectory, sample_idx, batch_size
         )
     return RolloutTrajectoryData(
         rollout_log_probs=log_probs,
@@ -163,6 +181,7 @@ def _serialize_rollout_trajectory(
     if rtd.denoising_env:
         env = rtd.denoising_env
         serialized_denoising_env = {
+            "sample_layout": env.sample_layout,
             "image_kwargs": (
                 _maybe_serialize(env.image_kwargs) if env.image_kwargs else None
             ),
@@ -185,6 +204,8 @@ def _serialize_rollout_trajectory(
             ),
             "timesteps": serialized_dit_timesteps,
             "sigmas": serialized_dit_sigmas,
+            "latent_step_indices": _maybe_serialize(dit.latent_step_indices),
+            "model_timesteps": _maybe_serialize(dit.model_timesteps),
         }
     return (
         serialized_log_probs,

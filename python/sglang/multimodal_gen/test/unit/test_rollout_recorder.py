@@ -1,12 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Behavioral contracts for owned snapshots of generic named streams."""
+"""Behavioral contracts for owned joint-state capture and wire transport."""
 
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+    _build_response,
+)
+from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
+    bytes_to_tensor,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutDenoisingEnv,
+    RolloutTrajectoryData,
+)
 from sglang.multimodal_gen.runtime.post_training.rollout_recorder import (
     RolloutRecorder,
     RolloutStreamSpec,
+    legacy_video_trajectory,
 )
 
 
@@ -82,6 +94,38 @@ def test_gather_is_stream_specific_and_abort_never_gathers():
     other.capture_before(0, {"video": state["video"]})
     other.abort()
     assert len(calls) == 1
+
+
+def test_legacy_video_transport_preserves_packed_conditioning():
+    recorder = RolloutRecorder([spec()], retain_steps=[0, 3])
+    state = {"video": torch.zeros(1, 4, 3)}
+    for step in range(3):
+        recorder.capture_before(step, state)
+    streams = recorder.finish(state)
+    # A one-token tensor must not lose its token axis just because B == 1.
+    env = RolloutDenoisingEnv(
+        pos_cond_kwargs={"h3_token_tags": torch.ones(1)}, sample_layout="single_packed"
+    )
+    output = OutputBatch(
+        output=torch.zeros(1, 3, 1, 4, 4),
+        rollout_trajectory_data=RolloutTrajectoryData(
+            rollout_log_probs=torch.zeros(1, 3),
+            denoising_env=env,
+            dit_trajectory=legacy_video_trajectory(streams),
+            stream_trajectories=streams,
+        ),
+    )
+    response = _build_response("test", "prompt", 1, True, output)[0]
+    wire = response.dit_trajectory
+    torch.testing.assert_close(
+        bytes_to_tensor(wire["latents"]["data"]), streams["video"].latents[0]
+    )
+    assert bytes_to_tensor(wire["latent_step_indices"]["data"]).tolist() == [0, 3]
+    assert response.denoising_env["pos_cond_kwargs"]["h3_token_tags"]["shape"] == [1]
+    assert bytes_to_tensor(response.dit_trajectory["timesteps"]["data"]).tolist() == [
+        1000,
+        0,
+    ]
 
 
 @pytest.mark.parametrize("indices", [[-1], [4], [True]])

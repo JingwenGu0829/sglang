@@ -204,6 +204,135 @@ def test_rank_local_token_tags_match_reference_slice():
                 )
 
 
+def test_h3_sampling_params_accept_rollout():
+    from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
+
+    params = MiniMaxH3SamplingParams(rollout=True, rollout_return_dit_trajectory=True)
+    assert params.rollout is True
+    assert params.rollout_return_dit_trajectory is True
+
+
+def test_h3_negated_v_ode_matches_native_euler():
+    from sglang.multimodal_gen.runtime.post_training.flow_transition import flow_step
+
+    state = torch.randn(7, 16, generator=torch.Generator().manual_seed(11))
+    velocity = torch.randn_like(state)
+    expected = state.clone()
+    _minimax_h3_update_target_rows_(
+        expected,
+        velocity.clone(),
+        sigma_t=state.new_tensor(0.7),
+        sigma_curr=0.7,
+        sigma_ratio=state.new_tensor(0.2 / 0.7),
+        one_minus_sigma_ratio=state.new_tensor(1 - 0.2 / 0.7),
+        denoised_scratch=torch.empty_like(state),
+    )
+    actual = flow_step(
+        sample=state.unsqueeze(0),
+        model_output=-velocity.unsqueeze(0),
+        current_sigma=state.new_tensor(0.7),
+        next_sigma=state.new_tensor(0.2),
+        sigma_max=0.7,
+        method="ode",
+        noise_level=0,
+        legacy_score=True,
+        variance_noise=None,
+    ).sample.squeeze(0)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("method", ["ode", "sde", "cps"])
+def test_h3_video_rollout_captures_owned_states_without_changing_audio(method):
+    from sglang.multimodal_gen.runtime.post_training.h3_rollout import H3RolloutSession
+
+    branch = _branch("t2va")
+    video = torch.zeros(branch.img_pos.numel(), 96)
+    audio = torch.zeros(branch.audio_pos.numel(), 32)
+    video_sigmas, audio_sigmas = [1.0, 0.7, 0.3, 0.0], [1.0, 0.8, 0.2, 0.0]
+    outputs = []
+    for capture in (False, True):
+        session = H3RolloutSession(
+            video_shape=tuple(video.shape),
+            video_sigmas=video_sigmas,
+            generator=torch.Generator().manual_seed(17),
+            method=method,
+            noise_level=0.5,
+            legacy_score=True,
+            capture=capture,
+            debug=True,
+            retain_steps=[0, 2, 3],
+            sde_steps=None,
+        )
+        seen_video, seen_audio = [], []
+
+        def advance(step, v, velocity, a, av, update_v, update_a):
+            seen_video.append(v.clone())
+            seen_audio.append(a.clone())
+            session.advance(step, v, velocity, a, av, update_v, update_a)
+
+        final_v, final_a = minimax_h3_denoise_loop(
+            model=SimpleNamespace(prepare_adaln_plans=lambda _: None),
+            model_forward=lambda *args: (
+                torch.ones_like(video),
+                torch.ones_like(audio),
+            ),
+            positive=branch,
+            initial_video_rows=video,
+            initial_audio_rows=audio,
+            keyframe_cond_rows=None,
+            sigmas_video=video_sigmas,
+            sigmas_audio=audio_sigmas,
+            device=torch.device("cpu"),
+            apply_step=advance,
+        )
+        result = session.finish(final_v)
+        outputs.append((final_v.clone(), final_a.clone(), result.rollout_log_probs))
+        assert result.rollout_log_probs.shape == (1, 3)
+        if capture:
+            assert set(result.stream_trajectories) == {"video"}
+            torch.testing.assert_close(
+                result.dit_trajectory.latents,
+                result.stream_trajectories["video"].latents,
+            )
+            assert result.dit_trajectory.timesteps.tolist() == [1000, 300, 0]
+            for name, before, final, sigmas in (
+                ("video", seen_video, final_v, video_sigmas),
+            ):
+                trajectory = result.stream_trajectories[name]
+                assert trajectory.latent_step_indices.tolist() == [0, 2, 3]
+                expected = torch.stack([before[0], before[2], final], dim=0)
+                torch.testing.assert_close(trajectory.latents[0], expected)
+                torch.testing.assert_close(trajectory.sigmas, torch.tensor(sigmas))
+                torch.testing.assert_close(
+                    trajectory.model_timesteps,
+                    torch.tensor([1 - s for s in sigmas[:-1]]),
+                )
+                assert trajectory.timesteps.shape == (4,)
+            assert not torch.equal(
+                result.dit_trajectory.latents[:, 0],
+                result.dit_trajectory.latents[:, -1],
+            )
+            with pytest.raises(ValueError, match="finish once"):
+                session.finish(final_v)
+        else:
+            assert result.stream_trajectories == {}
+    for left, right in zip(*outputs):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    # Audio uses exactly the original deterministic native update.
+    _, native_audio = minimax_h3_denoise_loop(
+        model=SimpleNamespace(prepare_adaln_plans=lambda _: None),
+        model_forward=lambda *args: (torch.ones_like(video), torch.ones_like(audio)),
+        positive=branch,
+        initial_video_rows=video,
+        initial_audio_rows=audio,
+        keyframe_cond_rows=None,
+        sigmas_video=video_sigmas,
+        sigmas_audio=audio_sigmas,
+        device=torch.device("cpu"),
+    )
+    torch.testing.assert_close(outputs[0][1], native_audio, rtol=0, atol=0)
+
+
 def test_cube_metadata_builder_uses_packed_layout_and_validates_step_count():
     packed = minimax_h3_packed_sequence(
         text_len=3,

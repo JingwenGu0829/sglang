@@ -1,32 +1,38 @@
-# Generic rollout contracts
+# Model-specific video rollout
 
-The generic denoising loop uses explicit stream specifications and an owned,
-loop-local recorder. Existing video rollout requests keep their legacy response
-format and scoring convention.
+Generic ODE/SDE/CPS transitions and owned trajectory recording are now used by
+the H3, Cosmos3 and LTX custom denoising loops. The HTTP interface exposes the
+legacy video trajectory, per-step scores, and conditioning snapshot.
 
-## Responsibilities
+## Model adapters
 
-- `flow_transition.py` contains request-independent ODE/SDE/CPS math. Callers
-  supply predictions, sigma pairs and noise; the result contains the next state,
-  transition mean, noise scale, and per-sample score sum/count.
-- `rollout_recorder.py` owns cloned snapshots, validates shapes and schedules,
-  and gathers retained boundaries. Stream specifications are generic; the
-  serving integration currently records video. Capture never draws noise or
-  advances a scheduler, and aborting performs no collectives.
-- `RolloutDenoisingMixin` and `SchedulerRLMixin` bridge the existing request,
-  scheduler session, conditioning and debug interfaces. The existing Cosmos
-  collection hooks remain until its custom loop is migrated in the next layer.
+- H3 uses a request-local adapter instead of a temporary scheduler. It maps
+  native velocity to `-v`, adds a batch axis to packed rows, and owns its video
+  snapshots before each in-place update. Native audio updates still execute.
+- Cosmos3 uses the same recorder and drops the legacy mixin collection hooks.
+  It retains video-only rollout admission; serving UniPC keeps its native call
+  signature. Rollout resources are released even when denoising fails.
+- LTX supports single-stage Euler with standard CFG. Its video gather removes
+  SP padding, while its existing audio scheduler continues deterministic
+  updates. Two-stage, res2s and custom guider rollout remain unsupported.
 
-## State and compatibility
+## Output contract
 
-Internal trajectories use `[B, K, ...]` and retain their original boundary
-indices. Named streams carry full `N+1` schedules. The legacy video projection
-keeps retained timesteps and full sigmas, including for sparse capture.
+Internal named trajectories use `[B, K, ...]`. The legacy `dit_trajectory`
+response retains sparse timesteps and full sigmas. It also exports the original
+boundary indices and optional model timesteps; H3's model clock is `1 - sigma`
+while its rollout clock is `sigma * 1000`. Packed H3 conditioning is explicitly
+marked as a single sample so token axes survive response slicing.
 
-Global rollout noise is prepared before SP sharding. Per-sample generators draw
-one full sample each; score sum/count already represent that full state and
-must not be all-reduced again. The existing negative squared residual score is
-preserved; it is not a normalized Gaussian log density.
+Only video is recorded in model integrations at this layer. H3/LTX still need
+their native audio computation during sampling; joint audio/video capture and
+the public `stream_trajectories` response are introduced by the next layer.
 
-Model-specific video adapters and the public audio/video stream response are
-subsequent layers. This layer adds neither an audio policy nor trainer replay.
+## Remaining boundaries
+
+Scheduler session state still lives on the request. Conditioning dictionaries
+and legacy video scores remain compatibility boundaries. The negative squared
+residual score is not a normalized Gaussian likelihood. Audio policy scoring,
+decoded audio transport, conditioned-coordinate masks and trainer replay are
+separate work. Full checkpoint inference and training replay are not validated
+by the focused unit and sequence-parallel tests.

@@ -1,6 +1,6 @@
 import math
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
@@ -37,6 +37,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
+)
+from sglang.multimodal_gen.runtime.post_training.rollout_recorder import (
+    RolloutStreamSpec,
 )
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
@@ -179,6 +182,23 @@ class LTX2DenoisingStage(DenoisingStage):
         self.sampler_name = sampler_name
         # set per request by _prepare_denoising_loop before the cache-dit hook
         self._disable_cache_dit_for_request = False
+
+    def _rollout_stream_specs(
+        self, ctx: LTX2DenoisingContext, batch: Req, server_args: ServerArgs
+    ) -> list[RolloutStreamSpec]:
+        specs = super()._rollout_stream_specs(ctx, batch, server_args)
+        video_spec = specs[0]
+        if batch.raw_latent_shape is None or len(batch.raw_latent_shape) != 3:
+            raise ValueError("LTX rollout requires the original packed video shape")
+        video_tokens = int(batch.raw_latent_shape[1])
+
+        def gather_video(stacked: torch.Tensor) -> torch.Tensor:
+            # Packed time sharding may pad whole video frames on the last rank.
+            return video_spec.gather(stacked)[:, :, :video_tokens]
+
+        specs[0] = replace(video_spec, gather=gather_video)
+
+        return specs
 
     def _scheduler_step_kwargs(self, batch: Req, scheduler) -> dict:
         return self.prepare_extra_func_kwargs(
@@ -1440,6 +1460,16 @@ class LTX2DenoisingStage(DenoisingStage):
             if phase is not None
             else ("stage1" if ctx.use_ltx23_legacy_one_stage else "one_stage")
         )
+        if batch.rollout and (
+            self.sampler_name != "euler"
+            or is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name)
+            or self._get_ltx2_stage1_guider_params(batch, server_args, ctx.stage)
+            is not None
+        ):
+            raise ValueError(
+                "LTX rollout currently requires single-stage Euler with standard CFG; "
+                "res2s, two-stage and custom guider paths need explicit transition adapters"
+            )
         ctx.audio_latents = batch.audio_latents
         # Video and audio keep separate scheduler state throughout the denoising loop.
         ctx.audio_scheduler = clone_scheduler_runtime(ctx.scheduler)
@@ -1825,19 +1855,13 @@ class LTX2DenoisingStage(DenoisingStage):
                     midpoint_model_call=_stage2_midpoint_model_call,
                 )
             else:
-                if batch.rollout:
-                    ctx.scheduler._step_index = step.step_index
-                    ctx.latents = ctx.scheduler.step(
-                        model_video,
-                        step.t_device,
-                        ctx.latents,
-                        return_dict=False,
-                        **self._scheduler_step_kwargs(batch, ctx.scheduler),
-                    )[0]
-                else:
-                    ctx.latents = ctx.scheduler.step(
-                        model_video, step.t_device, ctx.latents, return_dict=False
-                    )[0]
+                ctx.latents = ctx.scheduler.step(
+                    model_video,
+                    step.t_device,
+                    ctx.latents,
+                    return_dict=False,
+                    **self._scheduler_step_kwargs(batch, ctx.scheduler),
+                )[0]
                 ctx.audio_latents = ctx.audio_scheduler.step(
                     model_audio, step.t_device, ctx.audio_latents, return_dict=False
                 )[0]

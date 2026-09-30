@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.post_training.h3_rollout import H3RolloutSession
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
@@ -736,6 +737,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         placement_managed = self._component_residency_manager is not None
         if placement_managed:
             self._manage_dit_use_site(self.transformer, "transformer", batch)
+        rollout = None
         try:
             model = _resolve_denoise_model(
                 self.transformer,
@@ -780,6 +782,44 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device=device,
             )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
+            if batch.rollout:
+                generator = batch.generator
+                if isinstance(generator, list):
+                    if len(generator) != 1:
+                        raise ValueError(
+                            "H3 packed rollout requires one sample generator"
+                        )
+                    generator = generator[0]
+                if not isinstance(generator, torch.Generator):
+                    raise ValueError("H3 rollout requires a request generator")
+                rollout = H3RolloutSession(
+                    video_shape=tuple(initial_video[positive.video_target_slice].shape),
+                    video_sigmas=sigmas_video,
+                    generator=generator,
+                    method=batch.rollout_sde_type,
+                    noise_level=batch.rollout_noise_level,
+                    legacy_score=batch.rollout_log_prob_no_const,
+                    capture=batch.rollout_return_dit_trajectory,
+                    debug=batch.rollout_debug_mode,
+                    retain_steps=batch.rollout_return_step_indices,
+                    sde_steps=batch.rollout_sde_step_indices,
+                )
+            rollout_env = self._snapshot_rollout_environment(
+                batch,
+                image_kwargs={},
+                pos_cond_kwargs={
+                    "encoder_hidden_states": emb["hidden_states"],
+                    "h3_packed_layout": packed,
+                    "h3_token_tags": tags,
+                    "h3_video_condition_rows": ctx.cond_rows,
+                    "h3_audio_reference_rows": ctx.audio_ref_rows,
+                    "h3_video_condition_noise_aug": float(imgvid_noise_aug),
+                    "h3_audio_condition_noise_aug": float(audio_noise_aug),
+                },
+                neg_cond_kwargs=None,
+                guidance=None,
+                sample_layout="single_packed",
+            )
             with (
                 maybe_nvtx_range("denoising_loop", self.current_use_nvtx),
                 self.progress_bar(
@@ -814,12 +854,20 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     audio_cond_noise_aug_for_inference=float(audio_noise_aug),
                     attn_metadata=attn_metadata,
                     on_step=on_step,
+                    apply_step=rollout.advance if rollout is not None else None,
                     step_profiler=partial(
                         self._profile_denoising_step,
                         batch=batch,
                     ),
                 )
+            if rollout is not None:
+                batch.rollout_trajectory_data = rollout.finish(
+                    video_rows[positive.video_target_slice],
+                )
+                batch.rollout_trajectory_data.denoising_env = rollout_env
         finally:
+            if rollout is not None:
+                rollout.abort()
             self._finish_active_component_use()
         _publish_full_loop_outputs(
             ctx,
