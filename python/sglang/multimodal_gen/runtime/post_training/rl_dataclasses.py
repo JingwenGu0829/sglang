@@ -48,12 +48,18 @@ class RolloutDenoisingEnv:
 
 @dataclass
 class RolloutDitTrajectory:
-    # [B, T+1, ...]: per-step noisy latents x_{t_0..t_{T-1}} followed by the
-    # final denoised latent x_{t_T} (last scheduler.step output).
+    # [B, K, ...]: retained joint boundaries, indexed by latent_step_indices.
+    # Full capture includes the N pre-update states and the final state.
     latents: torch.Tensor | None = None
-    timesteps: torch.Tensor | None = None  # [T]
-    # [T+1] scheduler.sigmas snapshot (post-shift, includes terminal 0).
+    # Full [N+1] rollout clock in named streams; retained [K] in legacy dit_trajectory.
+    timesteps: torch.Tensor | None = None
+    # Full [N+1] sigma schedule, independent of sparse latent capture.
     sigmas: torch.Tensor | None = None
+    # Original loop-boundary indices for retained latents, independent of the
+    # full timesteps/sigmas arrays. Required when capture is sparse.
+    latent_step_indices: torch.Tensor | None = None
+    # Actual model clock when it differs from the exported rollout clock (H3).
+    model_timesteps: torch.Tensor | None = None
 
 
 @dataclass
@@ -62,3 +68,5 @@ class RolloutTrajectoryData:
     rollout_debug_tensors: RolloutDebugTensors | None = None
     denoising_env: RolloutDenoisingEnv | None = None
     dit_trajectory: RolloutDitTrajectory | None = None
+    # Additive multi-stream output. dit_trajectory remains the video projection.
+    stream_trajectories: dict[str, RolloutDitTrajectory] = field(default_factory=dict)

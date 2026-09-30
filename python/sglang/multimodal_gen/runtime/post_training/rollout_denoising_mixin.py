@@ -1,15 +1,15 @@
-"""Mixin for rollout-related denoising hooks.
+"""Compatibility boundary for legacy rollout schedulers and conditioning.
 
-Moved out of DenoisingStage to keep the core stage lean.
+Trajectory ownership lives in RolloutRecorder. This mixin only bridges existing
+request/scheduler APIs while their transition interface is migrated.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDenoisingEnv,
     RolloutDitTrajectory,
@@ -21,19 +21,22 @@ from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
 from sglang.multimodal_gen.runtime.post_training.sp_utils import (
     gather_stacked_latents_for_sp,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
-def _kwargs_to_cpu(d: Any) -> Any:
-    if isinstance(d, torch.Tensor):
-        return d.detach().cpu()
-    if isinstance(d, dict):
-        return {k: _kwargs_to_cpu(v) for k, v in d.items()}
-    if isinstance(d, list):
-        return [_kwargs_to_cpu(v) for v in d]
-    if isinstance(d, tuple):
-        return tuple(_kwargs_to_cpu(v) for v in d)
-    return d
+def _kwargs_to_cpu(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {k: _kwargs_to_cpu(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_kwargs_to_cpu(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_kwargs_to_cpu(v) for v in value)
+    return value
 
 
 class RolloutDenoisingMixin:
@@ -75,6 +78,35 @@ class RolloutDenoisingMixin:
                 )
             scheduler.release_rollout_resources(batch)
 
+    def _snapshot_rollout_environment(
+        self,
+        batch: Req,
+        *,
+        image_kwargs: dict,
+        pos_cond_kwargs: dict,
+        neg_cond_kwargs: dict | None,
+        guidance: torch.Tensor | None,
+    ) -> RolloutDenoisingEnv | None:
+        if not batch.rollout or not batch.rollout_return_denoising_env:
+            return None
+        config = self.server_args.pipeline_config
+        return RolloutDenoisingEnv(
+            image_kwargs=_kwargs_to_cpu(image_kwargs),
+            pos_cond_kwargs=_kwargs_to_cpu(
+                config.gather_denoising_env_static_for_sp(batch, pos_cond_kwargs)
+            ),
+            neg_cond_kwargs=(
+                _kwargs_to_cpu(
+                    config.gather_denoising_env_static_for_sp(batch, neg_cond_kwargs)
+                )
+                if neg_cond_kwargs
+                else None
+            ),
+            guidance=_kwargs_to_cpu(guidance),
+        )
+
+    # Retain the existing Cosmos entry points until its custom loop migrates
+    # to RolloutRecorder. The generic loop above no longer uses these hooks.
     def _postprocess_rollout_outputs(
         self,
         batch: Req,
