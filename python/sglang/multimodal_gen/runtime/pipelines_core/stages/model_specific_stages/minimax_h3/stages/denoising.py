@@ -794,7 +794,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     raise ValueError("H3 rollout requires a request generator")
                 rollout = H3RolloutSession(
                     video_shape=tuple(initial_video[positive.video_target_slice].shape),
+                    audio_shape=tuple(initial_audio[positive.audio_target_slice].shape),
                     video_sigmas=sigmas_video,
+                    audio_sigmas=[float(v) for v in ctx.sigmas["audio"]],
                     generator=generator,
                     method=batch.rollout_sde_type,
                     noise_level=batch.rollout_noise_level,
@@ -863,6 +865,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             if rollout is not None:
                 batch.rollout_trajectory_data = rollout.finish(
                     video_rows[positive.video_target_slice],
+                    audio_rows[positive.audio_target_slice],
                 )
                 batch.rollout_trajectory_data.denoising_env = rollout_env
         finally:

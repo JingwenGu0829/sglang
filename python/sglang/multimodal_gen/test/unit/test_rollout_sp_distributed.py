@@ -29,8 +29,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_padded_video_capture_and_scores_match_unsharded_reference():
-    """Gather video without exposing padding or double-sharding RNG."""
+def test_padded_joint_capture_and_scores_match_unsharded_reference():
+    """Gather different stream lengths without exposing padding or double-sharding RNG."""
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -55,6 +55,10 @@ def test_padded_video_capture_and_scores_match_unsharded_reference():
             torch.arange(2 * 5 * 3, device=device, dtype=torch.float32).reshape(2, 5, 3)
             / 30
         )
+        audio = (
+            torch.arange(2 * 7 * 2, device=device, dtype=torch.float32).reshape(2, 7, 2)
+            / 30
+        )
         reference = video.clone()
         batch = SimpleNamespace(
             latents=video,
@@ -71,9 +75,14 @@ def test_padded_video_capture_and_scores_match_unsharded_reference():
         scheduler.set_timesteps(3, device=device)
         scheduler.prepare_rollout(batch, cfg)
         video_local, batch.did_sp_shard_latents = cfg.shard_latents_for_sp(batch, video)
+        audio_local, batch.did_sp_shard_audio_latents = cfg.shard_audio_latents_for_sp(
+            batch, audio
+        )
         ctx = SimpleNamespace(
             latents=video_local,
+            audio_latents=audio_local,
             scheduler=scheduler,
+            audio_scheduler=scheduler,
             timesteps=scheduler.timesteps,
         )
         stage = LTX2DenoisingStage.__new__(LTX2DenoisingStage)
@@ -86,9 +95,10 @@ def test_padded_video_capture_and_scores_match_unsharded_reference():
         reference_generators = [
             torch.Generator(device).manual_seed(70 + i) for i in range(2)
         ]
-        video_states, scores = [], []
+        video_states, audio_states, scores = [], [], []
         for i in range(3):
             video_states.append(reference.clone())
+            audio_states.append(audio.clone())
             recorder.capture_before(i, stage._rollout_state(ctx))
             batch._rollout_loop_step_index = i
             s0, s1 = scheduler.sigmas[i : i + 2]
@@ -100,6 +110,8 @@ def test_padded_video_capture_and_scores_match_unsharded_reference():
                 s1,
                 batch.generator,
             )
+            ctx.audio_latents.add_(s1 - s0)
+            audio.add_(s1 - s0)
             noise = torch.cat(
                 [
                     torch.randn((1, 5, 3), device=device, generator=g)
@@ -120,8 +132,9 @@ def test_padded_video_capture_and_scores_match_unsharded_reference():
             reference = step.sample
             scores.append(step.score_sum / step.element_count)
         video_states.append(reference)
+        audio_states.append(audio)
         result = recorder.finish(stage._rollout_state(ctx))
-        for name, states in [("video", video_states)]:
+        for name, states in [("video", video_states), ("audio", audio_states)]:
             expected = torch.stack([states[i] for i in [0, 2, 3]], dim=1).cpu()
             torch.testing.assert_close(result[name].latents, expected, rtol=0, atol=0)
         torch.testing.assert_close(
@@ -131,7 +144,7 @@ def test_padded_video_capture_and_scores_match_unsharded_reference():
             atol=0,
         )
         print(
-            f"rank={rank}: padded video gather, B=2 global RNG and scores match unsharded reference exactly"
+            f"rank={rank}: padded video/audio gather, B=2 global RNG and scores match unsharded reference exactly"
         )
     finally:
         destroy_model_parallel()

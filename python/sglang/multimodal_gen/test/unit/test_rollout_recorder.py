@@ -96,9 +96,9 @@ def test_gather_is_stream_specific_and_abort_never_gathers():
     assert len(calls) == 1
 
 
-def test_legacy_video_transport_preserves_packed_conditioning():
-    recorder = RolloutRecorder([spec()], retain_steps=[0, 3])
-    state = {"video": torch.zeros(1, 4, 3)}
+def test_wire_transport_slices_streams_and_preserves_packed_conditioning():
+    recorder = RolloutRecorder([spec(), spec("audio", (1, 2, 5))], retain_steps=[0, 3])
+    state = {"video": torch.zeros(1, 4, 3), "audio": torch.ones(1, 2, 5)}
     for step in range(3):
         recorder.capture_before(step, state)
     streams = recorder.finish(state)
@@ -116,11 +116,12 @@ def test_legacy_video_transport_preserves_packed_conditioning():
         ),
     )
     response = _build_response("test", "prompt", 1, True, output)[0]
-    wire = response.dit_trajectory
-    torch.testing.assert_close(
-        bytes_to_tensor(wire["latents"]["data"]), streams["video"].latents[0]
-    )
-    assert bytes_to_tensor(wire["latent_step_indices"]["data"]).tolist() == [0, 3]
+    for name, expected in streams.items():
+        wire = response.stream_trajectories[name]
+        actual = bytes_to_tensor(wire["latents"]["data"])
+        torch.testing.assert_close(actual, expected.latents[0])
+        assert bytes_to_tensor(wire["latent_step_indices"]["data"]).tolist() == [0, 3]
+        assert bytes_to_tensor(wire["timesteps"]["data"]).shape == (4,)
     assert response.denoising_env["pos_cond_kwargs"]["h3_token_tags"]["shape"] == [1]
     assert bytes_to_tensor(response.dit_trajectory["timesteps"]["data"]).tolist() == [
         1000,

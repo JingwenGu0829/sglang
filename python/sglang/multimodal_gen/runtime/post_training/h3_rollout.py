@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""H3 packed-row adapter: video policy with native deterministic audio updates."""
+"""H3 packed-row adapter: video policy with deterministic audio replay state."""
 
 from collections.abc import Callable, Sequence
 
@@ -32,7 +32,9 @@ class H3RolloutSession:
         self,
         *,
         video_shape: tuple[int, int],
+        audio_shape: tuple[int, int],
         video_sigmas: Sequence[float],
+        audio_sigmas: Sequence[float],
         generator: torch.Generator,
         method: FlowMethod,
         noise_level: float,
@@ -46,8 +48,8 @@ class H3RolloutSession:
             raise ValueError(f"Unsupported H3 rollout method: {method}")
         if method == "ode" and not legacy_score:
             raise ValueError("ODE rollout has no Gaussian density; use legacy scores")
-        if len(video_sigmas) < 2:
-            raise ValueError("H3 rollout requires at least one video transition")
+        if len(video_sigmas) < 2 or len(video_sigmas) != len(audio_sigmas):
+            raise ValueError("H3 rollout requires aligned video/audio boundaries")
         self._video_sigmas = tuple(video_sigmas)
         self._num_steps = len(video_sigmas) - 1
         self._sde_steps = None if sde_steps is None else frozenset(sde_steps)
@@ -55,9 +57,9 @@ class H3RolloutSession:
             type(i) is not int or not 0 <= i < self._num_steps for i in self._sde_steps
         ):
             raise ValueError("H3 SDE indices must be valid loop steps")
-        self._shapes = {"video": (1, *video_shape)}
+        self._shapes = {"video": (1, *video_shape), "audio": (1, *audio_shape)}
         specs = []
-        for name, schedule in (("video", video_sigmas),):
+        for name, schedule in (("video", video_sigmas), ("audio", audio_sigmas)):
             sigmas = torch.tensor(schedule, dtype=torch.float32)
             if (
                 not torch.isfinite(sigmas).all()
@@ -103,10 +105,10 @@ class H3RolloutSession:
         update_video: Callable[[], None],
         update_audio: Callable[[], None],
     ) -> None:
-        """Capture video before updating it; advance audio with its native callback."""
+        """Native-loop callback. Both snapshots precede either in-place update."""
         if self._closed or step != self._next_step or step >= self._num_steps:
             raise ValueError("H3 rollout steps must be consecutive and active")
-        state = {"video": video.unsqueeze(0)}
+        state = {"video": video.unsqueeze(0), "audio": audio.unsqueeze(0)}
         for name, tensor in state.items():
             if tuple(tensor.shape) != self._shapes[name]:
                 raise ValueError(f"H3 {name} shape changed during rollout")
@@ -149,12 +151,14 @@ class H3RolloutSession:
         update_audio()
         self._next_step += 1
 
-    def finish(self, video: torch.Tensor) -> RolloutTrajectoryData:
+    def finish(self, video: torch.Tensor, audio: torch.Tensor) -> RolloutTrajectoryData:
         if self._closed or self._next_step != self._num_steps:
             raise ValueError("H3 rollout must finish once after all transitions")
         try:
             streams = (
-                self._recorder.finish({"video": video.unsqueeze(0)})
+                self._recorder.finish(
+                    {"video": video.unsqueeze(0), "audio": audio.unsqueeze(0)}
+                )
                 if self._recorder is not None
                 else {}
             )

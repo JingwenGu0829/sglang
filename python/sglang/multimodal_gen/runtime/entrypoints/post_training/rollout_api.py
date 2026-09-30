@@ -155,6 +155,10 @@ def _slice_rollout_trajectory_for_sample(
         rollout_debug_tensors=debug_tensors,
         denoising_env=denoising_env,
         dit_trajectory=dit_trajectory,
+        stream_trajectories={
+            name: _slice_stream_trajectory(trajectory, sample_idx, batch_size)
+            for name, trajectory in rtd.stream_trajectories.items()
+        },
     )
 
 
@@ -285,6 +289,19 @@ def _build_response(
                 rollout_debug_tensors=serialized_debug_tensors,
                 denoising_env=serialized_denoising_env,
                 dit_trajectory=serialized_dit_trajectory,
+                stream_trajectories={
+                    name: {
+                        "latents": _maybe_serialize(trajectory.latents),
+                        "timesteps": _maybe_serialize(trajectory.timesteps),
+                        "sigmas": _maybe_serialize(trajectory.sigmas),
+                        "latent_step_indices": _maybe_serialize(
+                            trajectory.latent_step_indices
+                        ),
+                        "model_timesteps": _maybe_serialize(trajectory.model_timesteps),
+                    }
+                    for name, trajectory in per_sample_trajectory.stream_trajectories.items()
+                }
+                or None,
                 inference_time_s=inference_time_s,
                 peak_memory_mb=peak_memory_mb,
             )

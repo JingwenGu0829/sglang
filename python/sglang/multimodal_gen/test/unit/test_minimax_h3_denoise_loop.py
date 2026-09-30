@@ -242,7 +242,7 @@ def test_h3_negated_v_ode_matches_native_euler():
 
 
 @pytest.mark.parametrize("method", ["ode", "sde", "cps"])
-def test_h3_video_rollout_captures_owned_states_without_changing_audio(method):
+def test_h3_joint_rollout_captures_owned_states_without_changing_audio(method):
     from sglang.multimodal_gen.runtime.post_training.h3_rollout import H3RolloutSession
 
     branch = _branch("t2va")
@@ -253,7 +253,9 @@ def test_h3_video_rollout_captures_owned_states_without_changing_audio(method):
     for capture in (False, True):
         session = H3RolloutSession(
             video_shape=tuple(video.shape),
+            audio_shape=tuple(audio.shape),
             video_sigmas=video_sigmas,
+            audio_sigmas=audio_sigmas,
             generator=torch.Generator().manual_seed(17),
             method=method,
             noise_level=0.5,
@@ -285,11 +287,10 @@ def test_h3_video_rollout_captures_owned_states_without_changing_audio(method):
             device=torch.device("cpu"),
             apply_step=advance,
         )
-        result = session.finish(final_v)
+        result = session.finish(final_v, final_a)
         outputs.append((final_v.clone(), final_a.clone(), result.rollout_log_probs))
         assert result.rollout_log_probs.shape == (1, 3)
         if capture:
-            assert set(result.stream_trajectories) == {"video"}
             torch.testing.assert_close(
                 result.dit_trajectory.latents,
                 result.stream_trajectories["video"].latents,
@@ -297,6 +298,7 @@ def test_h3_video_rollout_captures_owned_states_without_changing_audio(method):
             assert result.dit_trajectory.timesteps.tolist() == [1000, 300, 0]
             for name, before, final, sigmas in (
                 ("video", seen_video, final_v, video_sigmas),
+                ("audio", seen_audio, final_a, audio_sigmas),
             ):
                 trajectory = result.stream_trajectories[name]
                 assert trajectory.latent_step_indices.tolist() == [0, 2, 3]
@@ -313,7 +315,7 @@ def test_h3_video_rollout_captures_owned_states_without_changing_audio(method):
                 result.dit_trajectory.latents[:, -1],
             )
             with pytest.raises(ValueError, match="finish once"):
-                session.finish(final_v)
+                session.finish(final_v, final_a)
         else:
             assert result.stream_trajectories == {}
     for left, right in zip(*outputs):

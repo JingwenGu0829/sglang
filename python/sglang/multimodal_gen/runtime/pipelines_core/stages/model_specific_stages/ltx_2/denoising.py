@@ -183,10 +183,16 @@ class LTX2DenoisingStage(DenoisingStage):
         # set per request by _prepare_denoising_loop before the cache-dit hook
         self._disable_cache_dit_for_request = False
 
+    def _rollout_state(self, ctx: LTX2DenoisingContext) -> dict[str, torch.Tensor]:
+        if ctx.audio_latents is None:
+            raise ValueError("LTX rollout requires audio state")
+        return {"video": ctx.latents, "audio": ctx.audio_latents}
+
     def _rollout_stream_specs(
         self, ctx: LTX2DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> list[RolloutStreamSpec]:
         specs = super()._rollout_stream_specs(ctx, batch, server_args)
+        state = self._rollout_state(ctx)
         video_spec = specs[0]
         if batch.raw_latent_shape is None or len(batch.raw_latent_shape) != 3:
             raise ValueError("LTX rollout requires the original packed video shape")
@@ -198,6 +204,27 @@ class LTX2DenoisingStage(DenoisingStage):
 
         specs[0] = replace(video_spec, gather=gather_video)
 
+        def gather_audio(stacked: torch.Tensor) -> torch.Tensor:
+            if not batch.did_sp_shard_audio_latents:
+                return stacked
+            bsz, steps = stacked.shape[:2]
+            full = server_args.pipeline_config.gather_audio_latents_for_sp(
+                stacked.flatten(0, 1), batch
+            )
+            return full.unflatten(0, (bsz, steps))
+
+        start = ctx.audio_scheduler.begin_index or 0
+        specs.append(
+            RolloutStreamSpec(
+                name="audio",
+                local_shape=tuple(state["audio"].shape),
+                timesteps=torch.cat((ctx.timesteps, ctx.timesteps.new_zeros(1))),
+                sigmas=ctx.audio_scheduler.sigmas[
+                    start : start + len(ctx.timesteps) + 1
+                ],
+                gather=gather_audio,
+            )
+        )
         return specs
 
     def _scheduler_step_kwargs(self, batch: Req, scheduler) -> dict:

@@ -243,7 +243,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
         if self.return_trajectory_latents or self.return_trajectory_decoded:
             raise ValueError(
                 "MiniMax H3 does not support generic trajectory output; "
-                "use rollout_return_dit_trajectory for video rollout state"
+                "use rollout_return_dit_trajectory for joint video/audio rollout state"
             )
         seeds = self.seed if isinstance(self.seed, list) else [self.seed]
         for seed in seeds:

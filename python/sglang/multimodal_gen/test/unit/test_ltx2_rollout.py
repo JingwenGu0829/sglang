@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise video capture around LTX's real Euler video/audio step."""
+"""Exercise joint capture around LTX's real Euler video/audio step."""
 
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -17,7 +17,7 @@ from sglang.multimodal_gen.runtime.post_training.rollout_recorder import Rollout
 
 
 @pytest.mark.parametrize("method", ["ode", "sde", "cps"])
-def test_ltx_video_capture_preserves_sampling_and_native_audio(method, monkeypatch):
+def test_ltx_joint_capture_preserves_sampling_and_audio_replay(method, monkeypatch):
     for module in ("scheduler_rl_mixin", "sp_utils"):
         monkeypatch.setattr(
             f"sglang.multimodal_gen.runtime.post_training.{module}.get_sp_world_size",
@@ -88,10 +88,10 @@ def test_ltx_video_capture_preserves_sampling_and_native_audio(method, monkeypat
             if capture
             else None
         )
-        expected_video = []
+        expected_audio = []
         for i, t in enumerate(ctx.timesteps):
             state = stage._rollout_state(ctx)
-            expected_video.append(ctx.latents.clone())
+            expected_audio.append(ctx.audio_latents.clone())
             if recorder is not None:
                 recorder.capture_before(i, state)
             # Audio follows native Euler using the joint state before either update.
@@ -104,10 +104,10 @@ def test_ltx_video_capture_preserves_sampling_and_native_audio(method, monkeypat
             torch.testing.assert_close(ctx.audio_latents, audio_next, rtol=0, atol=0)
         streams = recorder.finish(stage._rollout_state(ctx)) if recorder else {}
         if capture:
-            expected_video.append(ctx.latents.clone())
+            expected_audio.append(ctx.audio_latents.clone())
             torch.testing.assert_close(
-                streams["video"].latents,
-                torch.stack(expected_video, dim=1),
+                streams["audio"].latents,
+                torch.stack(expected_audio, dim=1),
                 rtol=0,
                 atol=0,
             )
@@ -123,4 +123,4 @@ def test_ltx_video_capture_preserves_sampling_and_native_audio(method, monkeypat
     for actual, expected in zip(captured[:3], uncaptured[:3]):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert captured[3]["video"].latents.shape == (1, 4, 4, 3)
-    assert set(captured[3]) == {"video"}
+    assert captured[3]["audio"].latents.shape == (1, 4, 2, 5)
