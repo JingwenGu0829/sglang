@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Flow-matching rollout step utilities for log-prob computation."""
 
+from __future__ import annotations
+
 import math
-from typing import Any, Union
+from typing import TYPE_CHECKING, Any, Union
 
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutSessionData,
 )
@@ -18,6 +19,10 @@ from sglang.multimodal_gen.runtime.post_training.scheduler_rl_debug_mixin import
 )
 
 _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
+
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 
 class SchedulerRLMixin(SchedulerRLDebugMixin):
@@ -33,7 +38,13 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         """Release rollout-owned resources. Call when denoising ends or before a new rollout."""
         batch._rollout_session_data = None
 
-    def prepare_rollout(self, batch: Req, pipeline_config: Any = None) -> None:
+    def prepare_rollout(
+        self,
+        batch: Req,
+        pipeline_config: Any = None,
+        *,
+        latents_shape: tuple | None = None,
+    ) -> None:
         """Enable rollout and set SDE/CPS params. Call once before the denoising loop."""
         if get_sp_world_size() > 1 and pipeline_config is None:
             raise RuntimeError(
@@ -42,9 +53,8 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         batch._rollout_session_data = RolloutSessionData(
             pipeline_config=pipeline_config,
             sigma_max=self.sigmas[min(1, len(self.sigmas) - 1)].item(),
-            latents_shape=(
-                tuple(batch.latents.shape) if batch.latents is not None else None
-            ),
+            latents_shape=latents_shape
+            or (tuple(batch.latents.shape) if batch.latents is not None else None),
         )
 
     def already_prepared_rollout(self, batch) -> bool:
@@ -97,7 +107,7 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         )
         for i in range(B):
             torch.randn(
-                rollout_session_data.latents_shape,
+                (1, *rollout_session_data.latents_shape[1:]),
                 out=buffer[i : i + 1],
                 generator=generator[i],
             )

@@ -43,6 +43,9 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.post_training.denoise_loop_observer import (
+    get_denoise_loop_observer,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
@@ -442,6 +445,39 @@ def _precompute_rope_cache(
     return True
 
 
+_H3_SDE_TIMESTEP_DIVISOR = 1000.0
+
+
+def _bind_h3_rollout_scheduler(batch: Req, sigmas_video: list[float], device) -> None:
+    """Attach a FlowMatch Euler (with RL mixin) so H3 can reuse flow_sde_sampling."""
+    from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+        FlowMatchEulerDiscreteScheduler,
+    )
+
+    scheduler = FlowMatchEulerDiscreteScheduler(
+        num_train_timesteps=int(_H3_SDE_TIMESTEP_DIVISOR),
+        shift=1.0,
+    )
+    scheduler.set_shift(1.0)
+    # ``set_timesteps`` appends a terminal 0; H3 schedules already include it.
+    sigmas = list(sigmas_video)
+    if sigmas and float(sigmas[-1]) == 0.0:
+        sigmas = sigmas[:-1]
+    scheduler.set_timesteps(sigmas=sigmas, device=device)
+    batch.scheduler = scheduler
+
+
+def _h3_rollout_generator(batch: Req) -> torch.Generator:
+    generator = batch.generator
+    if isinstance(generator, list):
+        if len(generator) != 1:
+            raise ValueError("H3 packed rollout requires exactly one sample generator")
+        generator = generator[0]
+    if not isinstance(generator, torch.Generator):
+        raise ValueError("H3 rollout requires a request generator")
+    return generator
+
+
 class MiniMaxH3DenoisingStage(DenoisingStage):
     def default_workload_iterations(
         self, batch: Req, num_inference_steps: int
@@ -457,6 +493,10 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         )
         self._minimax_h3_quality = "lossless"
         self._minimax_h3_cache_mode: str | None = None
+
+    def to_flow_model_output(self, model_output: torch.Tensor) -> torch.Tensor:
+        # x0 = x + σ v  ⇒  flow-matching model_output = −v (matches miles H3).
+        return (-model_output).float()
 
     def _owns_compile_warmup_lifecycle(self) -> bool:
         return True
@@ -628,7 +668,10 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        with self._offload_for_torch_compile_warmup(batch):
+        with (
+            self.rollout_lifecycle(batch),
+            self._offload_for_torch_compile_warmup(batch),
+        ):
             return self._forward_native(batch, server_args)
 
     def _forward_native(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -739,6 +782,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         placement_managed = self._component_residency_manager is not None
         if placement_managed:
             self._manage_dit_use_site(self.transformer, "transformer", batch)
+        serving_scheduler = batch.scheduler
         try:
             model = _resolve_denoise_model(
                 self.transformer,
@@ -783,44 +827,36 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device=device,
             )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
-            rollout_ctx = None
-            if getattr(batch, "rollout", False):
-                from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
-                    MiniMaxH3RolloutCollector,
-                    MiniMaxH3RolloutCtx,
+            if batch.rollout:
+                _bind_h3_rollout_scheduler(batch, sigmas_video, device)
+                rollout_generator = _h3_rollout_generator(batch)
+                self._maybe_prepare_rollout(
+                    batch,
+                    latents_shape=(
+                        1,
+                        *initial_video[positive.video_target_slice].shape,
+                    ),
                 )
-                from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
-                    RolloutTrajectoryData,
-                )
-
-                task = str(getattr(batch.sampling_params, "task", "") or "t2va").lower()
-                if task not in ("t2va",):
-                    raise ValueError(
-                        f"MiniMax H3 rollout currently supports task=t2va only, got {task!r}"
-                    )
-                generator = torch.Generator(device=device)
-                seed = getattr(batch.sampling_params, "seed", 0)
-                if isinstance(seed, list):
-                    seed = seed[0]
-                generator.manual_seed(int(seed))
-                collector = MiniMaxH3RolloutCollector(sigmas_video=sigmas_video)
-                packed_cpu = {
-                    k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
-                    for k, v in packed.items()
-                }
-                collector.pos_cond_kwargs = {
-                    "encoder_hidden_states": emb["hidden_states"].detach().cpu(),
-                    "h3_packed_layout": packed_cpu,
-                    "h3_token_tags": tags.detach().cpu(),
+            observer = get_denoise_loop_observer(batch)
+            observer.init_env(
+                self,
+                batch=batch,
+                pipeline_config=server_args.pipeline_config,
+                image_kwargs={},
+                pos_cond_kwargs={
+                    "encoder_hidden_states": emb["hidden_states"],
+                    "h3_packed_layout": packed,
+                    "h3_token_tags": tags,
                     "h3_video_target_start": positive.video_target_start,
-                }
-                rollout_ctx = MiniMaxH3RolloutCtx(
-                    batch=batch,
-                    generator=generator,
-                    sigmas_video=sigmas_video,
-                    collector=collector,
-                )
-                batch.rollout_trajectory_data = RolloutTrajectoryData()
+                    "h3_video_condition_rows": ctx.cond_rows,
+                    "h3_audio_reference_rows": ctx.audio_ref_rows,
+                    "h3_video_condition_noise_aug": float(imgvid_noise_aug),
+                    "h3_audio_condition_noise_aug": float(audio_noise_aug),
+                },
+                neg_cond_kwargs=None,
+                guidance=None,
+                sample_layout="single_packed",
+            )
             with (
                 maybe_nvtx_range("denoising_loop", self.current_use_nvtx),
                 self.progress_bar(
@@ -834,6 +870,46 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     progress_bar.update()
                     if not batch.is_warmup:
                         self.step_profile()
+
+                def apply_step(
+                    step,
+                    video_target,
+                    v_video,
+                    _audio_target,
+                    _v_audio,
+                    _update_video,
+                    update_audio,
+                ):
+                    sigma_curr = float(sigmas_video[step])
+                    sigma_next = float(sigmas_video[step + 1])
+                    t_traj = torch.tensor(
+                        sigma_curr * _H3_SDE_TIMESTEP_DIVISOR,
+                        device=video_target.device,
+                        dtype=torch.float32,
+                    )
+
+                    def apply_video():
+                        # Packed rows are [n_rows, width]; shared B treats dim0 as batch.
+                        sample = video_target.float().unsqueeze(0)
+                        updated = batch.scheduler.flow_sde_sampling(
+                            batch,
+                            self.to_flow_model_output(v_video).unsqueeze(0),
+                            sample,
+                            sample.new_tensor(sigma_curr),
+                            sample.new_tensor(sigma_next),
+                            rollout_generator,
+                        )
+                        video_target.copy_(updated.squeeze(0))
+                        return None
+
+                    self.step_latents(
+                        batch,
+                        video_target.unsqueeze(0),
+                        t_traj,
+                        step,
+                        apply=apply_video,
+                    )
+                    update_audio()
 
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     model=model,
@@ -855,17 +931,22 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     audio_cond_noise_aug_for_inference=float(audio_noise_aug),
                     attn_metadata=attn_metadata,
                     on_step=on_step,
+                    apply_step=apply_step if batch.rollout else None,
                     step_profiler=partial(
                         self._profile_denoising_step,
                         batch=batch,
                     ),
-                    rollout_ctx=rollout_ctx,
                 )
-                if rollout_ctx is not None:
-                    batch.rollout_trajectory_data = (
-                        rollout_ctx.collector.build_trajectory_data()
-                    )
+            observer.finalize(
+                self,
+                batch=batch,
+                latents=video_rows[positive.video_target_slice].unsqueeze(0),
+                num_inference_steps=len(sigmas_video) - 1,
+                final_timestep=torch.zeros((), dtype=torch.float32),
+                server_args=server_args,
+            )
         finally:
+            batch.scheduler = serving_scheduler
             self._finish_active_component_use()
         _publish_full_loop_outputs(
             ctx,

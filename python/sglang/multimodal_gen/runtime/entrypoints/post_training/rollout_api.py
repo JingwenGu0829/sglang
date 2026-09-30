@@ -96,7 +96,11 @@ def _slice_rollout_trajectory_for_sample(
             ),
         )
     denoising_env = None
-    if rtd.denoising_env:
+    if rtd.denoising_env and rtd.denoising_env.sample_layout == "single_packed":
+        if batch_size != 1:
+            raise ValueError("Packed rollout conditioning requires a single sample")
+        denoising_env = rtd.denoising_env
+    elif rtd.denoising_env:
         env = rtd.denoising_env
         denoising_env = RolloutDenoisingEnv(
             image_kwargs=(
@@ -163,6 +167,7 @@ def _serialize_rollout_trajectory(
     if rtd.denoising_env:
         env = rtd.denoising_env
         serialized_denoising_env = {
+            "sample_layout": env.sample_layout,
             "image_kwargs": (
                 _maybe_serialize(env.image_kwargs) if env.image_kwargs else None
             ),

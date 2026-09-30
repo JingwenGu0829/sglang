@@ -4,6 +4,7 @@ selection and fused-parameter shard-id plumbing in the weights updater."""
 
 import types
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -19,6 +20,63 @@ from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
 from sglang.multimodal_gen.runtime.post_training.weights_updater import (
     _load_weights_into_module,
 )
+
+NUM_STEPS = 16
+NUM_TRAIN_TIMESTEPS = 1000
+
+
+def test_cosmos_serving_keeps_unipc_call_contract():
+    """The shared rollout hook must not pass batch= to native serving UniPC."""
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
+        Cosmos3DenoisingStage,
+    )
+
+    stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+    stage.scheduler = _serving_scheduler()
+    stage._logged_parallel_config = True
+    stage.transformer = types.SimpleNamespace(
+        reset_cache=lambda: None,
+        reset_denoising_step=lambda: None,
+        set_denoising_step=lambda **kwargs: None,
+    )
+    stage.progress_bar = lambda iterable, **kwargs: iterable
+    stage.log_info = lambda *args: None
+    stage._run_transformer = lambda **kwargs: torch.ones_like(kwargs["latents"])
+    batch = types.SimpleNamespace(
+        latents=torch.zeros(1, 4, 2, 2, 2),
+        audio_latents=None,
+        timesteps=stage.scheduler.timesteps,
+        generator=None,
+        seed=None,
+        scheduler=None,
+        rollout=False,
+        guidance_scale=1.0,
+        profile=False,
+        sampling_params=types.SimpleNamespace(),
+        extra={
+            "cond_text_ids": torch.zeros(1, 3),
+            "cond_text_mask": torch.ones(1, 3),
+            "uncond_text_ids": torch.zeros(1, 3),
+            "uncond_text_mask": torch.ones(1, 3),
+            "video_shape": (2, 2, 2),
+            "cond_text_seq_len": 3,
+        },
+    )
+    # Reference follows the native scheduler's public serving interface.
+    reference = _serving_scheduler()
+    expected = batch.latents.clone()
+    for t in reference.timesteps:
+        expected = reference.step(
+            torch.ones_like(expected), t, expected, return_dict=False
+        )[0]
+    args = types.SimpleNamespace(enable_cfg_parallel=False, pipeline_config=None)
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3.get_sp_world_size",
+        return_value=1,
+    ):
+        result = stage._denoise_once(batch, args)
+    torch.testing.assert_close(result.latents, expected, rtol=0, atol=0)
+
 
 NUM_STEPS = 16
 NUM_TRAIN_TIMESTEPS = 1000

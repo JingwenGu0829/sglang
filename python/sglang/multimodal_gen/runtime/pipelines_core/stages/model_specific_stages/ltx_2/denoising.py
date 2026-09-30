@@ -186,6 +186,13 @@ class LTX2DenoisingStage(DenoisingStage):
             {"generator": batch.generator, "eta": batch.eta, "batch": batch},
         )
 
+    def _maybe_finalize_denoising_env_collection(self, batch, pipeline_config) -> None:
+        super()._maybe_finalize_denoising_env_collection(batch, pipeline_config)
+        trajectory = batch.rollout_trajectory_data.dit_trajectory
+        if trajectory is not None and batch.did_sp_shard_latents:
+            # Packed video gather may include whole-frame SP padding.
+            trajectory.latents = trajectory.latents[:, :, : batch.raw_latent_shape[1]]
+
     @staticmethod
     def _randn_like_with_batch_generators(
         reference_tensor: torch.Tensor, batch: Req
@@ -1440,6 +1447,15 @@ class LTX2DenoisingStage(DenoisingStage):
             if phase is not None
             else ("stage1" if ctx.use_ltx23_legacy_one_stage else "one_stage")
         )
+        if batch.rollout and (
+            self.sampler_name != "euler"
+            or is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name)
+            or self._get_ltx2_stage1_guider_params(batch, server_args, ctx.stage)
+            is not None
+        ):
+            raise ValueError(
+                "LTX rollout requires single-stage Euler with standard CFG"
+            )
         ctx.audio_latents = batch.audio_latents
         # Video and audio keep separate scheduler state throughout the denoising loop.
         ctx.audio_scheduler = clone_scheduler_runtime(ctx.scheduler)
@@ -1825,19 +1841,19 @@ class LTX2DenoisingStage(DenoisingStage):
                     midpoint_model_call=_stage2_midpoint_model_call,
                 )
             else:
-                if batch.rollout:
-                    ctx.scheduler._step_index = step.step_index
-                    ctx.latents = ctx.scheduler.step(
+                ctx.latents = self.step_latents(
+                    batch,
+                    ctx.latents,
+                    step.t_device,
+                    step.step_index,
+                    apply=lambda: ctx.scheduler.step(
                         model_video,
                         step.t_device,
                         ctx.latents,
                         return_dict=False,
                         **self._scheduler_step_kwargs(batch, ctx.scheduler),
-                    )[0]
-                else:
-                    ctx.latents = ctx.scheduler.step(
-                        model_video, step.t_device, ctx.latents, return_dict=False
-                    )[0]
+                    )[0],
+                )
                 ctx.audio_latents = ctx.audio_scheduler.step(
                     model_audio, step.t_device, ctx.audio_latents, return_dict=False
                 )[0]
