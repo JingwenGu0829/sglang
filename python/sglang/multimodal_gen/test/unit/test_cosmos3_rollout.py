@@ -4,15 +4,24 @@ selection and fused-parameter shard-id plumbing in the weights updater."""
 
 import types
 import unittest
+import weakref
+from contextlib import nullcontext
+from unittest import mock
 
 import torch
 
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
+    cosmos3,
+)
+from sglang.multimodal_gen.runtime.post_training import sp_utils
 from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
     prepare_rollout_request_scheduler,
 )
@@ -103,6 +112,120 @@ class TestPrepareRolloutRequestScheduler(unittest.TestCase):
 
         self.assertIs(batch.scheduler, serving)
         torch.testing.assert_close(serving.sigmas, expected)
+
+
+class TestCosmos3DenoisingRollout(unittest.TestCase):
+    def setUp(self):
+        # Exercise the real denoising loop and schedulers without model weights.
+        self.stage = cosmos3.Cosmos3DenoisingStage.__new__(
+            cosmos3.Cosmos3DenoisingStage
+        )
+        self.stage.transformer = types.SimpleNamespace(
+            reset_cache=lambda: None,
+            set_denoising_step=lambda **kwargs: None,
+            reset_denoising_step=lambda: None,
+        )
+        self.stage._logged_parallel_config = True
+        self.stage.log_info = lambda *args, **kwargs: None
+        self.stage.progress_bar = lambda iterable, **kwargs: iterable
+        self.stage.use_declared_component = lambda **kwargs: nullcontext()
+        self.stage._run_transformer = lambda **kwargs: torch.full_like(
+            kwargs["latents"], 0.25
+        )
+        self.args = types.SimpleNamespace(
+            pipeline_config=types.SimpleNamespace(
+                shard_latents_for_sp=lambda **kwargs: (kwargs["latents"], False)
+            ),
+            enable_cfg_parallel=False,
+        )
+        for module in (cosmos3, sp_utils):
+            patcher = mock.patch.object(module, "get_sp_world_size", return_value=1)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def make_batch(self, scheduler, *, rollout=False):
+        scheduler.set_timesteps(2, device="cpu")
+        self.stage.scheduler = scheduler
+        text = torch.ones(1, 2, dtype=torch.long)
+        return Req(
+            sampling_params=SamplingParams(
+                prompt="test",
+                guidance_scale=1.0,
+                rollout=rollout,
+                rollout_return_dit_trajectory=rollout,
+                rollout_log_prob_no_const=True,
+            ),
+            latents=torch.ones(1, 1, 1, 1, 1),
+            scheduler=scheduler if rollout else None,
+            timesteps=scheduler.timesteps,
+            generator=torch.Generator().manual_seed(0),
+            extra={
+                "cond_text_ids": text,
+                "cond_text_mask": text,
+                "uncond_text_ids": text,
+                "uncond_text_mask": text,
+                "cond_text_seq_len": 2,
+                "uncond_text_seq_len": 2,
+                "video_shape": (1, 1, 1),
+            },
+        )
+
+    def test_serving_schedulers_keep_their_normal_update(self):
+        for scheduler_cls in (
+            FlowUniPCMultistepScheduler,
+            FlowMatchEulerDiscreteScheduler,
+        ):
+            with self.subTest(scheduler=scheduler_cls.__name__):
+                batch = self.make_batch(scheduler_cls())
+                baseline = scheduler_cls()
+                baseline.set_timesteps(2, device="cpu")
+                expected = batch.latents.clone()
+                for timestep in baseline.timesteps:
+                    expected = baseline.step(
+                        torch.full_like(expected, 0.25),
+                        timestep,
+                        expected,
+                        return_dict=False,
+                    )[0]
+
+                self.assertIs(self.stage.forward(batch, self.args), batch)
+                torch.testing.assert_close(batch.latents, expected)
+                self.assertIsNone(batch.rollout_trajectory_data)
+
+    def test_rollout_still_collects_transitions(self):
+        batch = self.make_batch(FlowMatchEulerDiscreteScheduler(), rollout=True)
+
+        self.stage.forward(batch, self.args)
+
+        data = batch.rollout_trajectory_data
+        self.assertEqual(data.rollout_log_probs.shape, (1, 2))
+        self.assertTrue(torch.isfinite(data.rollout_log_probs).all())
+        self.assertEqual(data.dit_trajectory.latents.shape, (1, 3, 1, 1, 1, 1))
+        torch.testing.assert_close(data.dit_trajectory.latents[:, -1], batch.latents)
+        self.assertEqual(batch.rollout_controllers, {})
+        self.assertIsNone(batch._rollout_denoising_env_state)
+
+    def test_failed_loop_releases_controller_and_noise(self):
+        batch = self.make_batch(FlowMatchEulerDiscreteScheduler(), rollout=True)
+        refs = []
+
+        def fail_after_first_step(**kwargs):
+            controller = batch.rollout_controllers["visual"]
+            if controller.noise_buffer is not None:
+                refs.extend(
+                    (weakref.ref(controller), weakref.ref(controller.noise_buffer))
+                )
+                raise RuntimeError("transformer failed")
+            return torch.zeros_like(kwargs["latents"])
+
+        self.stage._run_transformer = fail_after_first_step
+        with self.assertRaisesRegex(RuntimeError, "transformer failed"):
+            self.stage.forward(batch, self.args)
+
+        self.assertEqual(len(refs), 2)
+        self.assertTrue(all(ref() is None for ref in refs))
+        self.assertEqual(batch.rollout_controllers, {})
+        self.assertIsNone(batch._rollout_denoising_env_state)
 
 
 class _FusedParamModule(torch.nn.Module):
