@@ -10,13 +10,14 @@ serving requests.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable
+from typing import Any, Callable
 
 import torch
 
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
     FlowRolloutController,
 )
@@ -28,9 +29,6 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
 from sglang.multimodal_gen.runtime.post_training.sp_utils import (
     gather_stacked_latents_for_sp,
 )
-
-if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 
 def release_rollout_resources(batch: Req) -> None:
@@ -161,24 +159,17 @@ def finalize_rollout_if_enabled(
     """
     if not batch.rollout:
         return
-    try:
-        _collect_rollout_log_probs(batch)
-        # Keep the final timestep on the same device as the loop's timesteps;
-        # transfer the complete trajectory to CPU once during finalization.
-        rollout = batch.rollout_controllers["visual"]
-        if rollout.step_timesteps:
-            final_timestep = final_timestep.to(rollout.step_timesteps[0].device)
-        # Append final denoised latent as the (T+1)-th entry (step_index=T),
-        # routed through the same filter so rollout_return_step_indices can
-        # include/exclude it.
-        rollout._maybe_append_dit_trajectory_step(
-            latents=latents,
-            timestep_value=final_timestep,
-            step_index=num_inference_steps,
-        )
-        _finalize_rollout_env(batch=batch, pipeline_config=pipeline_config)
-    finally:
-        release_rollout_resources(batch)
+    _collect_rollout_log_probs(batch)
+    # Append final denoised latent as the (T+1)-th entry (step_index=T),
+    # routed through the same filter so rollout_return_step_indices can
+    # include/exclude it.
+    batch.rollout_controllers["visual"]._maybe_append_dit_trajectory_step(
+        latents=latents,
+        timestep_value=final_timestep,
+        step_index=num_inference_steps,
+    )
+    _finalize_rollout_env(batch=batch, pipeline_config=pipeline_config)
+    batch.rollout_controllers = {}
 
 
 def _collect_rollout_log_probs(batch: Req) -> None:
