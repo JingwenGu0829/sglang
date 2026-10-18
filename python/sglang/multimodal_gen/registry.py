@@ -7,6 +7,8 @@ and sampling parameters. It allows for easy registration and retrieval of model
 information based on model paths or other identifiers.
 """
 
+from __future__ import annotations
+
 import dataclasses
 import importlib
 import os
@@ -25,7 +27,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.server_args import Backend
+    from sglang.multimodal_gen.runtime.server_args import Backend, ServerArgs
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.flux3_action import (
@@ -563,7 +565,7 @@ def _get_diffusers_model_info(
 @lru_cache(maxsize=1)
 def get_model_info(
     model_path: str,
-    backend: Optional[Union[str, "Backend"]] = None,
+    backend: Optional[Union[str, Backend]] = None,
     model_id: Optional[str] = None,
 ) -> Optional[ModelInfo]:
     """
@@ -732,3 +734,17 @@ def is_registered_diffusion_model_path(model_path: str) -> bool:
     return has_registered_diffusion_model_path(model_path) or (
         get_non_diffusers_pipeline_name(model_path) is not None
     )
+
+
+def get_served_pipeline_class(
+    server_args: ServerArgs,
+) -> type[ComposedPipelineBase] | None:
+    """Resolve the serving pipeline from an override or the model metadata."""
+    if server_args.pipeline_class_name:
+        return get_pipeline_class(server_args.pipeline_class_name)
+    model_info = get_model_info(
+        server_args.model_path,
+        backend=server_args.backend,
+        model_id=server_args.model_id,
+    )
+    return model_info.pipeline_cls if model_info else None

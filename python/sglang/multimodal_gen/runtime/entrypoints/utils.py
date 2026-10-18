@@ -43,6 +43,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     normalize_output_seeds as normalize_output_seeds,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.post_training.audio_rollout import (
+    validate_audio_rollout_request,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
@@ -1020,6 +1023,7 @@ def prepare_request(
         VSA_sparsity=vsa_sparsity,
     )
     sampling_params.apply_request_extra(req)
+    validate_audio_rollout_request(req, server_args)
     if getattr(sampling_params, "max_sequence_length", None) is not None:
         req.max_sequence_length = sampling_params.max_sequence_length
 

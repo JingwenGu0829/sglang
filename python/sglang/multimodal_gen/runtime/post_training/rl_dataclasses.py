@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """RL-specific dataclasses used by post-training and rollout paths."""
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import Any
 
 import torch
@@ -48,11 +48,8 @@ class RolloutStreamData:
 
 
 @dataclass
-class RolloutTrajectoryData:
-    rollout_log_probs: torch.Tensor | None = None
-    rollout_debug_tensors: RolloutDebugTensors | None = None
+class RolloutTrajectoryData(RolloutStreamData):
     denoising_env: RolloutDenoisingEnv | None = None
-    dit_trajectory: RolloutDitTrajectory | None = None
     audio: RolloutStreamData | None = None
 
 
@@ -64,7 +61,7 @@ def _cat_per_output(tensors: list[torch.Tensor | None]) -> torch.Tensor | None:
 
 
 def _concat_stream_data(
-    streams: list[RolloutStreamData | RolloutTrajectoryData | None],
+    streams: list[RolloutStreamData | None],
 ) -> RolloutStreamData | None:
     if not streams or any(stream is None for stream in streams):
         return None
@@ -92,7 +89,8 @@ def _concat_stream_data(
             sigmas=first.dit_trajectory.sigmas,
             latent_step_indices=first.dit_trajectory.latent_step_indices,
         )
-    return RolloutStreamData(
+    return replace(
+        first,
         rollout_log_probs=_cat_per_output(
             [stream.rollout_log_probs for stream in streams]
         ),
@@ -110,12 +108,8 @@ def concat_rollout_trajectory_data(
     if len(per_output) == 1:
         return per_output[0]
     visual = _concat_stream_data(per_output)
-    return RolloutTrajectoryData(
-        rollout_log_probs=visual.rollout_log_probs,
-        rollout_debug_tensors=visual.rollout_debug_tensors,
-        denoising_env=per_output[0].denoising_env,
-        dit_trajectory=visual.dit_trajectory,
-        audio=_concat_stream_data([data.audio for data in per_output]),
+    return replace(
+        visual, audio=_concat_stream_data([data.audio for data in per_output])
     )
 
 
@@ -128,7 +122,7 @@ def _slice_output_dim(
 
 
 def _select_stream_data(
-    stream: RolloutStreamData | RolloutTrajectoryData | None,
+    stream: RolloutStreamData | None,
     output_index: int,
 ) -> RolloutStreamData | None:
     if stream is None:
@@ -149,7 +143,8 @@ def _select_stream_data(
             sigmas=trajectory.sigmas,
             latent_step_indices=trajectory.latent_step_indices,
         )
-    return RolloutStreamData(
+    return replace(
+        stream,
         rollout_log_probs=_slice_output_dim(stream.rollout_log_probs, output_index),
         rollout_debug_tensors=debug,
         dit_trajectory=trajectory,
@@ -164,10 +159,6 @@ def select_output_rollout_trajectory(
     if rollout_trajectory_data is None or output_index is None:
         return rollout_trajectory_data
     visual = _select_stream_data(rollout_trajectory_data, output_index)
-    return RolloutTrajectoryData(
-        rollout_log_probs=visual.rollout_log_probs,
-        rollout_debug_tensors=visual.rollout_debug_tensors,
-        denoising_env=rollout_trajectory_data.denoising_env,
-        dit_trajectory=visual.dit_trajectory,
-        audio=_select_stream_data(rollout_trajectory_data.audio, output_index),
+    return replace(
+        visual, audio=_select_stream_data(rollout_trajectory_data.audio, output_index)
     )

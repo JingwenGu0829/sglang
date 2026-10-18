@@ -63,6 +63,7 @@ from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
     prepare_rollout_if_enabled,
+    rollout_scope,
     rollout_step_kwargs,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
@@ -1853,14 +1854,15 @@ class Cosmos3DenoisingStage(PipelineStage):
         return batch
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        if batch.extra.get("transfer_plan") is not None:
-            return self._forward_transfer(batch, server_args)
-        with self.use_declared_component(
-            component_name="transformer",
-            module=self.transformer,
-            phase="denoise",
-        ):
-            return self._denoise_once(batch, server_args)
+        with rollout_scope(batch):
+            if batch.extra.get("transfer_plan") is not None:
+                return self._forward_transfer(batch, server_args)
+            with self.use_declared_component(
+                component_name="transformer",
+                module=self.transformer,
+                phase="denoise",
+            ):
+                return self._denoise_once(batch, server_args)
 
     def _predict_noise_cfg(
         self,

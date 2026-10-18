@@ -445,6 +445,15 @@ class LTX2Pipeline(_BaseLTX2Pipeline):
     # Must match model_index.json `_class_name`.
     pipeline_name = "LTX2Pipeline"
 
+    @classmethod
+    def validate_audio_rollout_request(cls, batch: Req) -> None:
+        if batch.image_path or batch.extra.get("ltx2_stage1_guider_params") is not None:
+            raise ValueError("Audio rollout supports single-stage LTX Euler T2V only")
+        if not batch.generate_audio or not getattr(
+            batch.sampling_params, "generate_audio", True
+        ):
+            raise ValueError("Audio rollout requires generate_audio=True")
+
     def create_pipeline_stages(self, server_args: ServerArgs):
         _add_ltx2_front_stages(self)
         _add_ltx2_stage1_generation_stages(self)

@@ -45,7 +45,6 @@ from sglang.multimodal_gen.runtime.post_training.audio_rollout import (
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     AUDIO_STREAM,
-    RolloutFinalState,
     rollout_step_kwargs,
 )
 from sglang.multimodal_gen.runtime.server_args import (
@@ -1495,19 +1494,6 @@ class LTX2DenoisingStage(DenoisingStage):
         server_args: ServerArgs,
     ) -> LTX2DenoisingContext:
         """Extend the base context with LTX-2 audio, SP, and TI2V state."""
-        if batch.rollout_audio:
-            if (
-                server_args.pipeline_class_name != "LTX2Pipeline"
-                or self.sampler_name != "euler"
-                or batch.extra.get("ltx2_stage1_guider_params") is not None
-                or batch.image_path
-            ):
-                raise ValueError(
-                    "Audio rollout supports single-stage LTX Euler T2V only; "
-                    "TI2V, multi-stage and res2s sampling are not supported"
-                )
-            if not batch.generate_audio:
-                raise ValueError("Audio rollout requires generate_audio=True")
         self._disable_cache_dit_for_request = batch.image_path is not None
         base_ctx = super()._prepare_denoising_loop(batch, server_args)
         ctx = LTX2DenoisingContext(**base_ctx.to_kwargs())
@@ -2580,18 +2566,12 @@ class LTX2DenoisingStage(DenoisingStage):
             is_warmup=ctx.is_warmup,
         )
 
-    def _additional_rollout_final_states(
+    def _additional_rollout_latents(
         self, ctx: LTX2DenoisingContext, batch: Req
-    ) -> dict[str, RolloutFinalState]:
+    ) -> dict[str, torch.Tensor]:
         if AUDIO_STREAM not in batch.rollout_controllers:
             return {}
-        return {
-            AUDIO_STREAM: RolloutFinalState(
-                latents=ctx.audio_latents,
-                num_inference_steps=len(ctx.audio_scheduler.timesteps),
-                final_timestep=ctx.audio_scheduler.timesteps.new_zeros(()),
-            )
-        }
+        return {AUDIO_STREAM: ctx.audio_latents}
 
     def _post_denoising_loop(
         self,

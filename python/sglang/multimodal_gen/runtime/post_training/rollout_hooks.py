@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Rollout hooks for denoise loops.
 
-A loop calls ``prepare_rollout_if_enabled`` before SP sharding,
+A loop runs inside ``rollout_scope`` and calls ``prepare_rollout_if_enabled`` before SP sharding,
 ``init_rollout_env_if_enabled`` at the loop start and
 ``finalize_rollout_if_enabled`` at the loop end, and passes
 ``**rollout_step_kwargs(batch)`` to ``scheduler.step``. Every hook is a no-op for
@@ -11,7 +11,7 @@ serving requests.
 from __future__ import annotations
 
 import functools
-from dataclasses import dataclass
+from contextlib import contextmanager
 from typing import Any, Callable
 
 import torch
@@ -38,11 +38,23 @@ VISUAL_STREAM = "visual"
 AUDIO_STREAM = "audio"
 
 
-@dataclass
-class RolloutFinalState:
-    latents: torch.Tensor
-    num_inference_steps: int
-    final_timestep: torch.Tensor
+@contextmanager
+def rollout_scope(batch: Req):
+    """Own temporary rollout state for one denoising execution, including retries."""
+    if not batch.rollout:
+        yield
+        return
+    batch.rollout_controllers = {}
+    batch._rollout_denoising_env_state = None
+    batch.rollout_trajectory_data = None
+    try:
+        yield
+    except BaseException:
+        batch.rollout_trajectory_data = None
+        raise
+    finally:
+        batch.rollout_controllers = {}
+        batch._rollout_denoising_env_state = None
 
 
 def _kwargs_to_cpu(d: Any) -> Any:
@@ -195,7 +207,7 @@ def finalize_rollout_if_enabled(
     num_inference_steps: int,
     final_timestep: torch.Tensor,
     pipeline_config: Any,
-    additional_streams: dict[str, RolloutFinalState] | None = None,
+    additional_latents: dict[str, torch.Tensor] | None = None,
 ) -> None:
     """Finalize rollout-only outputs.
 
@@ -205,27 +217,24 @@ def finalize_rollout_if_enabled(
     """
     if not batch.rollout:
         return
-    states = {
-        VISUAL_STREAM: RolloutFinalState(latents, num_inference_steps, final_timestep),
-        **(additional_streams or {}),
-    }
-    if states.keys() != batch.rollout_controllers.keys():
+    stream_latents = {VISUAL_STREAM: latents, **(additional_latents or {})}
+    if not stream_latents.keys() <= {VISUAL_STREAM, AUDIO_STREAM}:
+        raise ValueError("Unsupported rollout stream")
+    if stream_latents.keys() != batch.rollout_controllers.keys():
         raise RuntimeError("Rollout final states must match the prepared streams")
-    if batch.rollout_trajectory_data is None:
-        batch.rollout_trajectory_data = RolloutTrajectoryData()
-    for stream, state in states.items():
-        data = _collect_stream_rollout(batch, batch.rollout_controllers[stream], state)
-        if stream == VISUAL_STREAM:
-            batch.rollout_trajectory_data.rollout_log_probs = data.rollout_log_probs
-            batch.rollout_trajectory_data.rollout_debug_tensors = (
-                data.rollout_debug_tensors
-            )
-            batch.rollout_trajectory_data.dit_trajectory = data.dit_trajectory
-        elif stream == AUDIO_STREAM:
-            batch.rollout_trajectory_data.audio = data
-        else:
-            raise ValueError(f"Unsupported rollout stream: {stream!r}")
-
+    # Validate every stream before any SP collective, and publish only once all
+    # streams and the optional environment have been collected successfully.
+    streams = {
+        stream: _collect_stream_rollout(
+            batch,
+            batch.rollout_controllers[stream],
+            stream_latents[stream],
+            num_inference_steps,
+            final_timestep,
+        )
+        for stream in stream_latents
+    }
+    env = None
     state = batch._rollout_denoising_env_state
     if state is not None and state["env"] is not None:
         env: RolloutDenoisingEnv = state["env"]
@@ -240,24 +249,27 @@ def finalize_rollout_if_enabled(
                     batch, state["neg_cond_kwargs_src"]
                 )
             )
-        batch.rollout_trajectory_data.denoising_env = env
-
-    batch._rollout_denoising_env_state = None
-    batch.rollout_controllers = {}
+    batch.rollout_trajectory_data = RolloutTrajectoryData(
+        **vars(streams[VISUAL_STREAM]),
+        denoising_env=env,
+        audio=streams.get(AUDIO_STREAM),
+    )
 
 
 def _collect_stream_rollout(
     batch: Req,
     controller: FlowRolloutController,
-    state: RolloutFinalState,
+    latents: torch.Tensor,
+    num_inference_steps: int,
+    final_timestep: torch.Tensor,
 ) -> RolloutStreamData:
     data = RolloutStreamData(rollout_log_probs=controller.collect_rollout_log_probs())
     if controller.debug_mode:
         data.rollout_debug_tensors = controller.collect_rollout_debug_tensors(batch)
     controller.record_trajectory_step(
-        latents=state.latents,
-        timestep_value=state.final_timestep,
-        step_index=state.num_inference_steps,
+        latents=latents,
+        timestep_value=final_timestep,
+        step_index=num_inference_steps,
     )
     if controller.step_latents:
         data.dit_trajectory = RolloutDitTrajectory(

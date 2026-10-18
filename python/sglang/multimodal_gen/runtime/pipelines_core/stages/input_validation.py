@@ -26,6 +26,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.post_training.audio_rollout import (
+    validate_audio_rollout_request,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.vision import load_image, load_video
@@ -363,6 +366,7 @@ class InputValidationStage(PipelineStage):
         Validate and prepare inputs.
         """
 
+        validate_audio_rollout_request(batch, server_args)
         self._generate_seeds(batch, server_args)
 
         if (

@@ -42,19 +42,6 @@ def all_gather_if_sp_sharded(batch, x: torch.Tensor, dim: int = 0) -> torch.Tens
     return sequence_model_parallel_all_gather(x, dim=dim)
 
 
-def gather_stacked_audio_latents_for_sp(
-    pipeline_config, batch, stacked_latents: torch.Tensor
-) -> torch.Tensor:
-    """Gather [B, T, ...] audio stacks only when audio was actually sharded."""
-    if get_sp_world_size() <= 1 or not batch.did_sp_shard_audio_latents:
-        return stacked_latents
-    bsz, t_steps = stacked_latents.shape[:2]
-    gathered = pipeline_config.gather_audio_latents_for_sp(
-        stacked_latents.flatten(0, 1).contiguous(), batch=batch
-    )
-    return gathered.unflatten(0, (bsz, t_steps))
-
-
 def maybe_trim_sp_rope_seq_for_batch(batch, rope: torch.Tensor) -> torch.Tensor:
     raw = getattr(batch, "raw_latent_shape", None)
     if raw is None or len(raw) < 2:

@@ -776,10 +776,6 @@ class SamplingParams:
         """
         check if the sampling params is compatible and valid with server_args
         """
-        if self.rollout_audio and not getattr(
-            pipeline_config, "supports_audio_rollout", False
-        ):
-            raise ValueError("This pipeline does not support audio rollout")
         task_type = self.resolve_task_type(pipeline_config)
         if task_type.is_action_gen():
             return

@@ -1,16 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """Audio rollout integration through real Euler steps and the HTTP serializer."""
 
+import asyncio
 import copy
 import gc
 import types
 import unittest
 import weakref
-from unittest.mock import patch
+from contextlib import nullcontext
+from unittest.mock import AsyncMock, Mock, patch
 
 import torch
+from fastapi import HTTPException
 
+from sglang.multimodal_gen.configs.sample.ltx_2 import (
+    LTX2SamplingParams,
+    LTX23SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.post_training import rollout_api
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     RolloutRequest,
 )
@@ -25,25 +33,42 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
+from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
+    LTX2Pipeline,
+    LTX2TwoStagePipeline,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
+    ComposedPipelineBase,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    expand_request_outputs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
+    InputValidationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
+    Cosmos3DenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising import (
+    LTX2DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.post_training.audio_rollout import (
     audio_rollout_generators,
     prepare_audio_rollout_if_enabled,
 )
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutTrajectoryData,
     concat_rollout_trajectory_data,
     select_output_rollout_trajectory,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     AUDIO_STREAM,
-    RolloutFinalState,
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
     prepare_rollout_if_enabled,
     rollout_step_kwargs,
-)
-from sglang.multimodal_gen.runtime.post_training.sp_utils import (
-    gather_stacked_audio_latents_for_sp,
 )
 
 
@@ -73,55 +98,77 @@ _CONFIG = types.SimpleNamespace(
 
 
 def _run(batch):
-    audio_scheduler = copy.deepcopy(batch.scheduler)
-    prepare_rollout_if_enabled(batch=batch, pipeline_config=_CONFIG)
-    prepare_audio_rollout_if_enabled(
-        batch=batch,
-        pipeline_config=_CONFIG,
-        scheduler=audio_scheduler,
-        latents=batch.audio_latents,
+    """Use the real LTX Euler/CFG branch and shared finalizer with a tiny joint model."""
+    stage = object.__new__(LTX2DenoisingStage)
+    stage.sampler_name = "euler"
+    stage.server_args = types.SimpleNamespace(
+        pipeline_config=_CONFIG, enable_cfg_parallel=False
     )
-    init_rollout_env_if_enabled(
-        batch=batch,
+    ctx = types.SimpleNamespace(
+        scheduler=batch.scheduler,
+        audio_scheduler=copy.deepcopy(batch.scheduler),
+        timesteps=batch.scheduler.timesteps,
+        latents=batch.latents,
+        audio_latents=batch.audio_latents,
+        stage="stage1",
+        is_ltx23_variant=False,
+        use_ltx23_legacy_one_stage=False,
         image_kwargs={},
         pos_cond_kwargs={},
         neg_cond_kwargs={},
         guidance=None,
+        denoise_mask=None,
+        clean_latent=None,
+        reserved_frames_mask=None,
+        z=None,
     )
-    for timestep in batch.scheduler.timesteps:
-        # Both predictions use the joint state before either scheduler advances.
-        video_prediction = batch.latents * 0.1 + batch.audio_latents.mean(
-            (1, 2), keepdim=True
+    batch.do_classifier_free_guidance = False
+    batch.prompt_embeds = batch.audio_prompt_embeds = [torch.zeros(2, 1, 1)]
+
+    def prepare(batch, server_args):
+        prepare_rollout_if_enabled(batch=batch, pipeline_config=_CONFIG)
+        prepare_audio_rollout_if_enabled(
+            batch=batch,
+            pipeline_config=_CONFIG,
+            scheduler=ctx.audio_scheduler,
+            latents=ctx.audio_latents,
         )
-        audio_prediction = batch.audio_latents * 0.1 + batch.latents.mean(
-            (1, 2), keepdim=True
+        return ctx
+
+    def model(ctx, step, kwargs):
+        return (
+            ctx.latents * 0.1 + ctx.audio_latents.mean((1, 2), keepdim=True),
+            ctx.audio_latents * 0.1 + ctx.latents.mean((1, 2), keepdim=True),
         )
-        batch.latents = batch.scheduler.step(
-            video_prediction,
-            timestep,
-            batch.latents,
-            **rollout_step_kwargs(batch),
-            return_dict=False,
-        )[0]
-        batch.audio_latents = audio_scheduler.step(
-            audio_prediction,
-            timestep,
-            batch.audio_latents,
-            **rollout_step_kwargs(batch, AUDIO_STREAM),
-            return_dict=False,
-        )[0]
-    finalize_rollout_if_enabled(
-        batch=batch,
-        latents=batch.latents,
-        num_inference_steps=3,
-        final_timestep=torch.tensor(0.0),
-        pipeline_config=_CONFIG,
-        additional_streams={
-            AUDIO_STREAM: RolloutFinalState(batch.audio_latents, 3, torch.tensor(0.0))
-        }
-        if batch.rollout_audio
-        else None,
+
+    def loop(ctx, batch, server_args):
+        for i, timestep in enumerate(ctx.timesteps):
+            stage._run_denoising_step(
+                ctx,
+                types.SimpleNamespace(step_index=i, t_device=timestep),
+                batch,
+                server_args,
+            )
+        return ctx.timesteps.cpu()
+
+    def finish(ctx, batch, server_args):
+        batch.latents, batch.audio_latents = ctx.latents, ctx.audio_latents
+
+    stage._offload_for_torch_compile_warmup = lambda batch: nullcontext()
+    stage._prepare_denoising_loop = prepare
+    stage._run_denoising_loop = loop
+    stage._finalize_denoising_loop = finish
+    stage._get_ltx2_stage1_guider_params = lambda *args: None
+    stage._prepare_ltx2_model_inputs = lambda *args: types.SimpleNamespace(
+        latent_model_input=ctx.latents
     )
+    stage._build_ltx2_base_model_kwargs = lambda *args: {}
+    stage._build_ltx2_model_kwargs = lambda *args, **kwargs: kwargs
+    stage._get_ltx_prompt_attention_mask = lambda *args, **kwargs: None
+    stage._ltx2_model_forward_context = lambda *args: nullcontext()
+    stage._ltx2_call_current_model = model
+    stage.post_forward_for_ti2v_task = lambda batch, args, mask, latents, z: latents
+    stage.forward(batch, stage.server_args)
     return batch.rollout_trajectory_data
 
 
@@ -246,82 +293,208 @@ class TestAudioRollout(unittest.TestCase):
                 data.audio.rollout_debug_tensors.rollout_model_outputs[i],
             )
 
-    def test_audio_sp_gather_uses_audio_flag_and_restores_batch_and_steps(self):
-        batch = types.SimpleNamespace(
-            did_sp_shard_latents=False, did_sp_shard_audio_latents=True
-        )
-        stacked = torch.arange(2 * 3 * 2).view(2, 3, 2, 1)
-        config = types.SimpleNamespace(
-            gather_audio_latents_for_sp=lambda x, batch: torch.cat([x, x + 100], dim=1)[
-                :, :3
-            ]
-        )
-        with patch(
-            "sglang.multimodal_gen.runtime.post_training.sp_utils.get_sp_world_size",
-            return_value=2,
-        ):
-            gathered = gather_stacked_audio_latents_for_sp(config, batch, stacked)
-            torch.testing.assert_close(
-                gathered, torch.cat([stacked, stacked[:, :, :1] + 100], dim=2)
-            )
-            batch.did_sp_shard_latents = True
-            batch.did_sp_shard_audio_latents = False
-            self.assertIs(
-                gather_stacked_audio_latents_for_sp(config, batch, stacked), stacked
-            )
-
-    def test_audio_noise_matches_unsharded_reference_with_two_padded_shards(self):
-        from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
-            LTX2PipelineConfig,
-        )
-
-        def step_audio(batch, config, rank=None):
-            scheduler = copy.deepcopy(batch.scheduler)
-            prepare_audio_rollout_if_enabled(
-                batch=batch,
-                pipeline_config=config,
-                scheduler=scheduler,
-                latents=batch.audio_latents,
-            )
-            if rank is not None:
-                batch.audio_latents, batch.did_sp_shard_audio_latents = (
-                    config.shard_audio_latents_for_sp(batch, batch.audio_latents)
-                )
-            result = scheduler.step(
-                torch.zeros_like(batch.audio_latents),
-                scheduler.timesteps[0],
-                batch.audio_latents,
-                **rollout_step_kwargs(batch, AUDIO_STREAM),
-                return_dict=False,
-            )[0]
-            return result, batch.rollout_controllers[
-                AUDIO_STREAM
-            ].collect_rollout_log_probs()
-
-        expected, expected_log_probs = step_audio(_batch(), _CONFIG)
-        shards = []
-        config = object.__new__(LTX2PipelineConfig)
-        with patch(
-            "sglang.multimodal_gen.configs.pipeline_configs.ltx_2.get_sp_world_size",
-            return_value=2,
-        ):
-            for rank in range(2):
-                batch = _batch()
-                with patch(
-                    "sglang.multimodal_gen.configs.pipeline_configs.ltx_2.get_sp_parallel_rank",
-                    return_value=rank,
-                ):
-                    result, log_probs = step_audio(batch, config, rank)
-                    shards.append(result)
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_cpu_generators_with_cuda_latents(self):
+        for mode in ("sde", "cps", "ode"):
+            with self.subTest(mode=mode):
+                cpu, gpu = _batch(), _batch()
+                cpu.rollout_sde_type = gpu.rollout_sde_type = mode
+                cpu.rollout_log_prob_no_const = gpu.rollout_log_prob_no_const = True
+                gpu.latents = gpu.latents.cuda()
+                gpu.audio_latents = gpu.audio_latents.cuda()
+                expected, actual = _run(cpu), _run(gpu)
+                for left, right in ((expected, actual), (expected.audio, actual.audio)):
                     torch.testing.assert_close(
-                        log_probs, expected_log_probs, rtol=0, atol=0
+                        left.rollout_log_probs, right.rollout_log_probs
                     )
-                    self.assertTrue(batch.sp_audio_has_padding)
-                    if rank == 1:
-                        self.assertTrue(torch.equal(result[:, -1], torch.zeros(2, 3)))
-        torch.testing.assert_close(
-            torch.cat(shards, dim=1)[:, :5], expected, rtol=0, atol=0
-        )
+                    torch.testing.assert_close(
+                        left.dit_trajectory.latents, right.dit_trajectory.latents
+                    )
+                    torch.testing.assert_close(
+                        left.rollout_debug_tensors.rollout_variance_noises,
+                        right.rollout_debug_tensors.rollout_variance_noises,
+                        rtol=0,
+                        atol=0,
+                    )
+                for a, b in zip(cpu.generator, gpu.generator):
+                    self.assertTrue(torch.equal(a.get_state(), b.get_state()))
+
+    def test_expanded_outputs_own_their_rollout_state(self):
+        for audio in (False, True):
+            with self.subTest(audio=audio):
+                parent = _batch(audio=audio)
+                parent.num_outputs_per_prompt = 2
+                children = expand_request_outputs(parent)
+                self.assertIsNot(
+                    children[0].rollout_controllers, children[1].rollout_controllers
+                )
+                self.assertIsNot(
+                    children[0].rollout_controllers, parent.rollout_controllers
+                )
+                for child in children:
+                    child.generator = [
+                        torch.Generator().manual_seed(10 + i) for i in range(2)
+                    ]
+                    child.scheduler = copy.deepcopy(parent.scheduler)
+                    _run(child)
+                    self.assertEqual(child.rollout_controllers, {})
+                    self.assertEqual(parent.rollout_controllers, {})
+                    self.assertEqual(
+                        child.rollout_trajectory_data.audio is not None, audio
+                    )
+
+    def test_denoising_stages_release_state_on_failure_and_retry(self):
+        for cls, loop_name in (
+            (DenoisingStage, "_denoise"),
+            (Cosmos3DenoisingStage, "_denoise_once"),
+        ):
+            with self.subTest(stage=cls.__name__):
+                batch = _batch(audio=False)
+                stage = object.__new__(cls)
+                stage._offload_for_torch_compile_warmup = lambda batch: nullcontext()
+                stage.use_declared_component = lambda **kwargs: nullcontext()
+                stage.transformer = Mock()
+                fail = True
+
+                def loop(batch, args):
+                    prepare_rollout_if_enabled(batch=batch, pipeline_config=_CONFIG)
+                    init_rollout_env_if_enabled(
+                        batch=batch,
+                        image_kwargs={},
+                        pos_cond_kwargs={},
+                        neg_cond_kwargs={},
+                        guidance=None,
+                    )
+                    if fail:
+                        raise RuntimeError("model failed")
+                    batch.latents = batch.scheduler.step(
+                        torch.zeros_like(batch.latents),
+                        batch.scheduler.timesteps[0],
+                        batch.latents,
+                        **rollout_step_kwargs(batch),
+                        return_dict=False,
+                    )[0]
+                    finalize_rollout_if_enabled(
+                        batch=batch,
+                        latents=batch.latents,
+                        num_inference_steps=1,
+                        final_timestep=torch.tensor(0.0),
+                        pipeline_config=_CONFIG,
+                    )
+                    return batch
+
+                setattr(stage, loop_name, loop)
+                with self.assertRaisesRegex(RuntimeError, "model failed"):
+                    stage.forward(batch, types.SimpleNamespace())
+                self.assertEqual(batch.rollout_controllers, {})
+                self.assertIsNone(batch._rollout_denoising_env_state)
+                self.assertIsNone(batch.rollout_trajectory_data)
+                fail = False
+                stage.forward(batch, types.SimpleNamespace())
+                self.assertEqual(batch.rollout_controllers, {})
+                self.assertIsNone(batch._rollout_denoising_env_state)
+                self.assertIsNotNone(batch.rollout_trajectory_data)
+
+    def test_request_boundaries_validate_resolved_pipeline_before_execution(self):
+        registry = "sglang.multimodal_gen.registry"
+        cases = [
+            (None, LTX2Pipeline, LTX2SamplingParams, True, {}, True),
+            ("LTX2Pipeline", LTX2Pipeline, LTX23SamplingParams, True, {}, True),
+            (None, LTX2TwoStagePipeline, LTX2SamplingParams, True, {}, False),
+            (
+                "LTX2TwoStagePipeline",
+                LTX2TwoStagePipeline,
+                LTX23SamplingParams,
+                True,
+                {},
+                False,
+            ),
+            (None, ComposedPipelineBase, SamplingParams, True, {}, False),
+            (
+                None,
+                LTX2Pipeline,
+                LTX2SamplingParams,
+                True,
+                {"generate_audio": False},
+                False,
+            ),
+            (
+                None,
+                LTX2Pipeline,
+                LTX2SamplingParams,
+                True,
+                {"image_path": "input.png"},
+                False,
+            ),
+            (None, LTX2Pipeline, LTX23SamplingParams, False, {}, True),
+            (None, ComposedPipelineBase, SamplingParams, False, {}, True),
+        ]
+        for name, cls, params_cls, rollout, extra, valid in cases:
+            with self.subTest(
+                pipeline=cls.__name__, override=name, rollout=rollout, extra=extra
+            ):
+                args = types.SimpleNamespace(
+                    pipeline_class_name=name,
+                    model_path="test",
+                    model_id=None,
+                    backend="sglang",
+                    attention_backend_config={},
+                    enable_trace=False,
+                )
+                request = RolloutRequest(
+                    prompt="test",
+                    seed=42,
+                    rollout=rollout,
+                    rollout_audio=True,
+                    extra_sampling_params=extra,
+                )
+                result = OutputBatch(
+                    output=torch.zeros(1, 1),
+                    rollout_trajectory_data=RolloutTrajectoryData(),
+                )
+                forward = AsyncMock(return_value=result)
+                with (
+                    patch(
+                        f"{registry}.get_model_info",
+                        return_value=types.SimpleNamespace(pipeline_cls=cls),
+                    ),
+                    patch(f"{registry}.get_pipeline_class", return_value=cls),
+                    patch.object(
+                        rollout_api, "get_global_server_args", return_value=args
+                    ),
+                    patch.object(
+                        rollout_api,
+                        "build_sampling_params",
+                        side_effect=lambda rid, **kw: params_cls(**kw),
+                    ),
+                    patch.object(
+                        rollout_api.async_scheduler_client, "forward", forward
+                    ),
+                ):
+                    if valid:
+                        self.assertEqual(
+                            asyncio.run(
+                                rollout_api.rollout_generate(request)
+                            ).status_code,
+                            200,
+                        )
+                        forward.assert_awaited_once()
+                    else:
+                        with self.assertRaises(HTTPException) as error:
+                            asyncio.run(rollout_api.rollout_generate(request))
+                        self.assertEqual(error.exception.status_code, 400)
+                        forward.assert_not_awaited()
+                    # The raw engine Req boundary uses the same policy before
+                    # seed allocation, image loading, or any text encoder work.
+                    raw = Req(
+                        sampling_params=params_cls(**_build_sampling_kwargs(request))
+                    )
+                    raw.sampling_params.apply_request_extra(raw)
+                    stage = object.__new__(InputValidationStage)
+                    stage._generate_seeds = Mock(side_effect=RuntimeError("validated"))
+                    with self.assertRaises(RuntimeError if valid else ValueError):
+                        stage.forward(raw, args)
+                    self.assertEqual(stage._generate_seeds.call_count, int(valid))
 
 
 if __name__ == "__main__":

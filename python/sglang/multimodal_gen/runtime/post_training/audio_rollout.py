@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Audio stream wiring for a loop with an independent Euler scheduler."""
 
-import functools
 import hashlib
 
 import torch
@@ -13,9 +12,6 @@ from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     AUDIO_STREAM,
     build_flow_rollout_controller,
     prepare_rollout_if_enabled,
-)
-from sglang.multimodal_gen.runtime.post_training.sp_utils import (
-    gather_stacked_audio_latents_for_sp,
 )
 
 
@@ -40,14 +36,20 @@ def audio_rollout_generators(generators):
     return [derive(generator) for generator in generators]
 
 
-def _shard_audio_noise(pipeline_config, batch, latents):
-    if not batch.did_sp_shard_audio_latents:
-        return latents
-    return pipeline_config.shard_audio_latents_for_sp(batch, latents)[0]
+def validate_audio_rollout_request(batch, server_args) -> None:
+    """Validate active audio rollouts using the pipeline selected for serving."""
+    if not (batch.rollout and batch.rollout_audio):
+        return
+    from sglang.multimodal_gen.registry import get_served_pipeline_class
+
+    pipeline_cls = get_served_pipeline_class(server_args)
+    if pipeline_cls is None:
+        raise ValueError("Could not resolve the pipeline for audio rollout")
+    pipeline_cls.validate_audio_rollout_request(batch)
 
 
 def prepare_audio_rollout_if_enabled(*, batch, pipeline_config, scheduler, latents):
-    """Register before audio SP sharding to retain the unpadded full shape."""
+    """Register the replicated audio stream of single-stage LTX generation."""
     if not (batch.rollout and batch.rollout_audio):
         return
     if not isinstance(scheduler, FlowMatchEulerDiscreteScheduler):
@@ -62,10 +64,8 @@ def prepare_audio_rollout_if_enabled(*, batch, pipeline_config, scheduler, laten
             sigmas=scheduler.sigmas,
             latents=latents,
             generator=generators,
-            shard_for_sp=functools.partial(_shard_audio_noise, pipeline_config),
-            gather_for_sp=functools.partial(
-                gather_stacked_audio_latents_for_sp, pipeline_config
-            ),
+            shard_for_sp=lambda batch, noise: noise,
+            gather_for_sp=lambda batch, trajectory: trajectory,
         )
 
     prepare_rollout_if_enabled(

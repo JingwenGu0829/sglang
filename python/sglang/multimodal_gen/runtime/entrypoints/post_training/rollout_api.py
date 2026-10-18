@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import fields, replace
 from typing import Any
 
 import torch
@@ -29,9 +30,6 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
-    RolloutDebugTensors,
-    RolloutDenoisingEnv,
-    RolloutDitTrajectory,
     RolloutStreamData,
     RolloutTrajectoryData,
 )
@@ -74,6 +72,40 @@ def _extract_single_sample_tensor(
     return obj
 
 
+def _slice_stream_for_sample(
+    stream: RolloutStreamData | None, sample_idx: int, batch_size: int
+) -> RolloutStreamData | None:
+    if stream is None:
+        return None
+    debug = stream.rollout_debug_tensors
+    if debug is not None:
+        debug = replace(
+            debug,
+            **{
+                field.name: _extract_single_sample_tensor(
+                    getattr(debug, field.name), sample_idx, batch_size
+                )
+                for field in fields(debug)
+            },
+        )
+    trajectory = stream.dit_trajectory
+    if trajectory is not None:
+        trajectory = replace(
+            trajectory,
+            latents=_extract_single_sample_tensor(
+                trajectory.latents, sample_idx, batch_size
+            ),
+        )
+    return replace(
+        stream,
+        rollout_log_probs=_extract_single_sample_tensor(
+            stream.rollout_log_probs, sample_idx, batch_size
+        ),
+        rollout_debug_tensors=debug,
+        dit_trajectory=trajectory,
+    )
+
+
 def _slice_rollout_trajectory_for_sample(
     rtd: RolloutTrajectoryData | None,
     sample_idx: int,
@@ -81,96 +113,53 @@ def _slice_rollout_trajectory_for_sample(
 ) -> RolloutTrajectoryData | None:
     if rtd is None:
         return None
-    log_probs = rtd.rollout_log_probs
-    if (
-        isinstance(log_probs, torch.Tensor)
-        and log_probs.dim() >= 1
-        and log_probs.shape[0] == batch_size
-    ):
-        log_probs = log_probs[sample_idx].contiguous()
-    debug_tensors = None
-    if rtd.rollout_debug_tensors:
-        rd = rtd.rollout_debug_tensors
-        debug_tensors = RolloutDebugTensors(
-            rollout_variance_noises=_extract_single_sample_tensor(
-                rd.rollout_variance_noises, sample_idx, batch_size
-            ),
-            rollout_prev_sample_means=_extract_single_sample_tensor(
-                rd.rollout_prev_sample_means, sample_idx, batch_size
-            ),
-            rollout_noise_std_devs=_extract_single_sample_tensor(
-                rd.rollout_noise_std_devs, sample_idx, batch_size
-            ),
-            rollout_model_outputs=_extract_single_sample_tensor(
-                rd.rollout_model_outputs, sample_idx, batch_size
-            ),
-        )
-    denoising_env = None
-    if rtd.denoising_env:
-        env = rtd.denoising_env
-        denoising_env = RolloutDenoisingEnv(
-            image_kwargs=(
-                _extract_single_sample_tensor(env.image_kwargs, sample_idx, batch_size)
-                if env.image_kwargs
-                else None
-            ),
-            pos_cond_kwargs=(
-                _extract_single_sample_tensor(
-                    env.pos_cond_kwargs, sample_idx, batch_size
+    env = rtd.denoising_env
+    if env is not None:
+        env = replace(
+            env,
+            **{
+                field.name: _extract_single_sample_tensor(
+                    getattr(env, field.name), sample_idx, batch_size
                 )
-                if env.pos_cond_kwargs
+                if field.name == "guidance" or getattr(env, field.name)
                 else None
-            ),
-            neg_cond_kwargs=(
-                _extract_single_sample_tensor(
-                    env.neg_cond_kwargs, sample_idx, batch_size
-                )
-                if env.neg_cond_kwargs
-                else None
-            ),
-            guidance=(
-                _extract_single_sample_tensor(env.guidance, sample_idx, batch_size)
-                if env.guidance is not None
-                else None
-            ),
+                for field in fields(env)
+            },
         )
-    dit_trajectory = None
-    if rtd.dit_trajectory:
-        dit = rtd.dit_trajectory
-        dit_trajectory = RolloutDitTrajectory(
-            latents=_extract_single_sample_tensor(dit.latents, sample_idx, batch_size),
-            timesteps=dit.timesteps,
-            sigmas=dit.sigmas,
-            latent_step_indices=dit.latent_step_indices,
-        )
-    return RolloutTrajectoryData(
-        rollout_log_probs=log_probs,
-        rollout_debug_tensors=debug_tensors,
-        denoising_env=denoising_env,
-        dit_trajectory=dit_trajectory,
-        audio=_slice_audio_rollout(rtd.audio, sample_idx, batch_size),
+    return replace(
+        _slice_stream_for_sample(rtd, sample_idx, batch_size),
+        denoising_env=env,
+        audio=_slice_stream_for_sample(rtd.audio, sample_idx, batch_size),
     )
 
 
-def _slice_audio_rollout(
-    stream: RolloutStreamData | None, sample_idx: int, batch_size: int
-) -> RolloutStreamData | None:
-    if stream is None:
-        return None
-    sliced = _slice_rollout_trajectory_for_sample(
-        RolloutTrajectoryData(
-            rollout_log_probs=stream.rollout_log_probs,
-            rollout_debug_tensors=stream.rollout_debug_tensors,
-            dit_trajectory=stream.dit_trajectory,
-        ),
-        sample_idx,
-        batch_size,
-    )
-    return RolloutStreamData(
-        rollout_log_probs=sliced.rollout_log_probs,
-        rollout_debug_tensors=sliced.rollout_debug_tensors,
-        dit_trajectory=sliced.dit_trajectory,
-    )
+def _serialize_stream(
+    stream: RolloutStreamData | None,
+    *,
+    serialized_dit_timesteps: dict | None = None,
+    serialized_dit_sigmas: dict | None = None,
+) -> dict:
+    debug = stream.rollout_debug_tensors if stream else None
+    trajectory = stream.dit_trajectory if stream else None
+    return {
+        "rollout_log_probs": _maybe_serialize(stream.rollout_log_probs)
+        if stream
+        else None,
+        "rollout_debug_tensors": {
+            field.name: _maybe_serialize(getattr(debug, field.name))
+            for field in fields(debug)
+        }
+        if debug is not None
+        else None,
+        "dit_trajectory": {
+            "latents": _maybe_serialize(trajectory.latents),
+            "timesteps": serialized_dit_timesteps,
+            "sigmas": serialized_dit_sigmas,
+            "latent_step_indices": _maybe_serialize(trajectory.latent_step_indices),
+        }
+        if trajectory is not None
+        else None,
+    }
 
 
 def _serialize_rollout_trajectory(
@@ -180,55 +169,27 @@ def _serialize_rollout_trajectory(
     serialized_dit_sigmas: dict | None = None,
 ) -> tuple[dict | None, dict | None, dict | None, dict | None]:
     """Return order: rollout_log_probs, rollout_debug_tensors, denoising_env, dit_trajectory."""
-    if rtd is None:
-        return None, None, None, None
-    serialized_log_probs = _maybe_serialize(rtd.rollout_log_probs)
-    serialized_debug_tensors = None
-    if rtd.rollout_debug_tensors:
-        rd = rtd.rollout_debug_tensors
-        serialized_debug_tensors = {
-            "rollout_variance_noises": _maybe_serialize(rd.rollout_variance_noises),
-            "rollout_prev_sample_means": _maybe_serialize(rd.rollout_prev_sample_means),
-            "rollout_noise_std_devs": _maybe_serialize(rd.rollout_noise_std_devs),
-            "rollout_model_outputs": _maybe_serialize(rd.rollout_model_outputs),
+    stream = _serialize_stream(
+        rtd,
+        serialized_dit_timesteps=serialized_dit_timesteps,
+        serialized_dit_sigmas=serialized_dit_sigmas,
+    )
+    env = rtd.denoising_env if rtd else None
+    serialized_env = (
+        {
+            field.name: _maybe_serialize(getattr(env, field.name))
+            if field.name == "guidance" or getattr(env, field.name)
+            else None
+            for field in fields(env)
         }
-    serialized_denoising_env = None
-    if rtd.denoising_env:
-        env = rtd.denoising_env
-        serialized_denoising_env = {
-            "image_kwargs": (
-                _maybe_serialize(env.image_kwargs) if env.image_kwargs else None
-            ),
-            "pos_cond_kwargs": (
-                _maybe_serialize(env.pos_cond_kwargs) if env.pos_cond_kwargs else None
-            ),
-            "neg_cond_kwargs": (
-                _maybe_serialize(env.neg_cond_kwargs) if env.neg_cond_kwargs else None
-            ),
-            "guidance": (
-                _maybe_serialize(env.guidance) if env.guidance is not None else None
-            ),
-        }
-    serialized_dit_trajectory = None
-    if rtd.dit_trajectory:
-        dit = rtd.dit_trajectory
-        serialized_dit_trajectory = {
-            "latents": (
-                _maybe_serialize(dit.latents) if dit.latents is not None else None
-            ),
-            "timesteps": serialized_dit_timesteps,
-            "sigmas": serialized_dit_sigmas,
-            "latent_step_indices": (
-                _maybe_serialize(dit.latent_step_indices)
-                if dit.latent_step_indices is not None
-                else None
-            ),
-        }
+        if env is not None
+        else None
+    )
     return (
-        serialized_log_probs,
-        serialized_debug_tensors,
-        serialized_denoising_env,
-        serialized_dit_trajectory,
+        stream["rollout_log_probs"],
+        stream["rollout_debug_tensors"],
+        serialized_env,
+        stream["dit_trajectory"],
     )
 
 
@@ -315,20 +276,12 @@ def _build_response(
         )
         audio_rollout = None
         if per_sample_trajectory.audio is not None:
-            stream = per_sample_trajectory.audio
-            audio_log_probs, audio_debug, _, audio_traj = _serialize_rollout_trajectory(
-                RolloutTrajectoryData(
-                    rollout_log_probs=stream.rollout_log_probs,
-                    rollout_debug_tensors=stream.rollout_debug_tensors,
-                    dit_trajectory=stream.dit_trajectory,
-                ),
-                serialized_dit_timesteps=audio_timesteps,
-                serialized_dit_sigmas=audio_sigmas,
-            )
             audio_rollout = {
-                "rollout_log_probs": audio_log_probs,
-                "rollout_debug_tensors": audio_debug,
-                "dit_trajectory": audio_traj,
+                **_serialize_stream(
+                    per_sample_trajectory.audio,
+                    serialized_dit_timesteps=audio_timesteps,
+                    serialized_dit_sigmas=audio_sigmas,
+                ),
                 "generated_output": _maybe_serialize(result.audio[sample_idx])
                 if result.audio is not None
                 else None,
@@ -405,22 +358,15 @@ async def rollout_generate(request: RolloutRequest):
     stamps.request_id = request_id
     server_args = get_global_server_args()
     sampling_kwargs = _build_sampling_kwargs(request)
-    if (
-        sampling_kwargs.get("rollout_audio")
-        and server_args.pipeline_class_name != "LTX2Pipeline"
-    ):
-        raise HTTPException(
-            status_code=400, detail="Audio rollout supports LTX2Pipeline only"
-        )
     try:
         sampling_params = build_sampling_params(request_id, **sampling_kwargs)
-    except Exception as exc:
+        pipeline_request = prepare_request(
+            server_args=server_args, sampling_params=sampling_params
+        )
+    except (ValueError, TypeError) as exc:
         raise HTTPException(
             status_code=400, detail=f"Invalid sampling params: {exc}"
         ) from exc
-    pipeline_request = prepare_request(
-        server_args=server_args, sampling_params=sampling_params
-    )
     try:
         with stamps.span("forward"):
             output_batch: OutputBatch = await async_scheduler_client.forward(

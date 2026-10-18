@@ -155,10 +155,10 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
-    RolloutFinalState,
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
     prepare_rollout_if_enabled,
+    rollout_scope,
     rollout_step_kwargs,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -2088,17 +2088,12 @@ class DenoisingStage(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        with self._offload_for_torch_compile_warmup(batch):
-            try:
-                return self._denoise(batch, server_args)
-            finally:
-                if batch.rollout:
-                    batch.rollout_controllers.clear()
-                    batch._rollout_denoising_env_state = None
+        with rollout_scope(batch), self._offload_for_torch_compile_warmup(batch):
+            return self._denoise(batch, server_args)
 
-    def _additional_rollout_final_states(
+    def _additional_rollout_latents(
         self, ctx: DenoisingContext, batch: Req
-    ) -> dict[str, RolloutFinalState]:
+    ) -> dict[str, torch.Tensor]:
         return {}
 
     @torch.no_grad()
@@ -2127,7 +2122,7 @@ class DenoisingStage(PipelineStage):
             num_inference_steps=len(timesteps_cpu),
             final_timestep=ctx.timesteps.new_zeros(()),
             pipeline_config=server_args.pipeline_config,
-            additional_streams=self._additional_rollout_final_states(ctx, batch),
+            additional_latents=self._additional_rollout_latents(ctx, batch),
         )
         self._finalize_denoising_loop(ctx, batch, server_args)
         return batch
