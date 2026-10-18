@@ -7,8 +7,6 @@ and sampling parameters. It allows for easy registration and retrieval of model
 information based on model paths or other identifiers.
 """
 
-from __future__ import annotations
-
 import dataclasses
 import importlib
 import os
@@ -565,7 +563,7 @@ def _get_diffusers_model_info(
 @lru_cache(maxsize=1)
 def get_model_info(
     model_path: str,
-    backend: Optional[Union[str, Backend]] = None,
+    backend: Optional[Union[str, "Backend"]] = None,
     model_id: Optional[str] = None,
 ) -> Optional[ModelInfo]:
     """
@@ -737,7 +735,7 @@ def is_registered_diffusion_model_path(model_path: str) -> bool:
 
 
 def get_served_pipeline_class(
-    server_args: ServerArgs,
+    server_args: "ServerArgs",
 ) -> type[ComposedPipelineBase] | None:
     """Resolve the serving pipeline from an override or the model metadata."""
     if server_args.pipeline_class_name:
