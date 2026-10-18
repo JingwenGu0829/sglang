@@ -26,8 +26,6 @@ class RLRolloutArgs:
     rollout_debug_mode: bool = False
 
     def validate(self) -> None:
-        if self.rollout_audio and not self.rollout:
-            raise ValueError("rollout_audio requires rollout=True")
         noise = self.rollout_noise_level
         if isinstance(noise, bool) or not isinstance(noise, (int, float)):
             raise ValueError(f"rollout_noise_level must be a number, got {noise!r}")
@@ -51,7 +49,6 @@ class RLRolloutArgs:
         """
         cls(
             rollout=params.rollout,
-            rollout_audio=getattr(params, "rollout_audio", False),
             rollout_sde_type=params.rollout_sde_type,
             rollout_noise_level=params.rollout_noise_level,
             rollout_log_prob_no_const=params.rollout_log_prob_no_const,
