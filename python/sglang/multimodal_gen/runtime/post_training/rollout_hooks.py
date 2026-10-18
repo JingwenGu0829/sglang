@@ -155,7 +155,6 @@ def init_rollout_env_if_enabled(
     pos_cond_kwargs: dict[str, Any],
     neg_cond_kwargs: dict[str, Any],
     guidance: torch.Tensor | None,
-    guidance_scale: float | None = None,
 ) -> None:
     """Snapshot the DiT conditioning that the trainer replays."""
     if not batch.rollout:
@@ -174,7 +173,6 @@ def init_rollout_env_if_enabled(
                 _kwargs_to_cpu(neg_cond_kwargs) if neg_cond_kwargs else None
             ),
             guidance=guidance.detach().cpu() if guidance is not None else None,
-            guidance_scale=guidance_scale,
         )
         pos_src = pos_cond_kwargs
         neg_src = neg_cond_kwargs

@@ -2117,7 +2117,6 @@ class DenoisingStage(PipelineStage):
             pos_cond_kwargs=ctx.pos_cond_kwargs,
             neg_cond_kwargs=ctx.neg_cond_kwargs,
             guidance=ctx.guidance,
-            guidance_scale=batch.guidance_scale if batch.rollout_audio else None,
         )
         timesteps_cpu = self._run_denoising_loop(ctx, batch, server_args)
 

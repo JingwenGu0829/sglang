@@ -1627,51 +1627,6 @@ class LTX2DenoisingStage(DenoisingStage):
             self._move_ltx2_scheduler_tensors_to_device(ctx.scheduler, device)
             self._move_ltx2_scheduler_tensors_to_device(ctx.audio_scheduler, device)
 
-        if batch.rollout_audio and batch.rollout_return_denoising_env:
-            # Full gathered trajectories are replayed without rank-local RoPE
-            # coordinates or SP padding. Snapshot both streams' static inputs.
-            ctx.image_kwargs = {
-                **ctx.image_kwargs,
-                "num_frames": int(
-                    (batch.num_frames - 1)
-                    // server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
-                    + 1
-                ),
-                "height": ctx.latent_height,
-                "width": ctx.latent_width,
-                "fps": batch.fps,
-                "audio_num_frames": batch.rollout_controllers[
-                    AUDIO_STREAM
-                ].latents_shape[1],
-                "return_dict": False,
-                "return_latents": False,
-            }
-            prompt_mask = self._get_ltx_prompt_attention_mask(
-                batch,
-                is_ltx23_variant=ctx.is_ltx23_variant
-                and not ctx.use_ltx23_legacy_one_stage,
-            )
-            ctx.pos_cond_kwargs = {
-                "encoder_hidden_states": batch.prompt_embeds[0],
-                "audio_encoder_hidden_states": batch.audio_prompt_embeds[0],
-                "encoder_attention_mask": prompt_mask,
-                "audio_encoder_attention_mask": prompt_mask,
-            }
-            if batch.do_classifier_free_guidance:
-                neg_mask = self._get_ltx_prompt_attention_mask(
-                    batch,
-                    is_ltx23_variant=ctx.is_ltx23_variant
-                    and not ctx.use_ltx23_legacy_one_stage,
-                    negative=True,
-                )
-                ctx.neg_cond_kwargs = {
-                    "encoder_hidden_states": batch.negative_prompt_embeds[0],
-                    "audio_encoder_hidden_states": batch.negative_audio_prompt_embeds[
-                        0
-                    ],
-                    "encoder_attention_mask": neg_mask,
-                    "audio_encoder_attention_mask": neg_mask,
-                }
         return ctx
 
     @staticmethod

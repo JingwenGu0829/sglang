@@ -23,7 +23,6 @@ class RolloutDenoisingEnv:
     pos_cond_kwargs: dict[str, Any] | None = None
     neg_cond_kwargs: dict[str, Any] | None = None
     guidance: torch.Tensor | None = None
-    guidance_scale: float | None = None
 
 
 @dataclass

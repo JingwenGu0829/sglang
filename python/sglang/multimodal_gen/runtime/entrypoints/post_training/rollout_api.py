@@ -133,7 +133,6 @@ def _slice_rollout_trajectory_for_sample(
                 if env.guidance is not None
                 else None
             ),
-            guidance_scale=env.guidance_scale,
         )
     dit_trajectory = None
     if rtd.dit_trajectory:
@@ -210,8 +209,6 @@ def _serialize_rollout_trajectory(
                 _maybe_serialize(env.guidance) if env.guidance is not None else None
             ),
         }
-        if env.guidance_scale is not None:
-            serialized_denoising_env["guidance_scale"] = env.guidance_scale
     serialized_dit_trajectory = None
     if rtd.dit_trajectory:
         dit = rtd.dit_trajectory
