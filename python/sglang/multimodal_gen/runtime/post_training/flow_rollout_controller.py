@@ -209,7 +209,7 @@ class FlowRolloutController:
         )
         for i in range(B):
             torch.randn(
-                self.latents_shape,
+                (1, *self.latents_shape[1:]),
                 out=buffer[i : i + 1],
                 generator=generators[i],
             )

@@ -155,6 +155,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
+    RolloutFinalState,
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
     prepare_rollout_if_enabled,
@@ -2088,7 +2089,17 @@ class DenoisingStage(PipelineStage):
         server_args: ServerArgs,
     ) -> Req:
         with self._offload_for_torch_compile_warmup(batch):
-            return self._denoise(batch, server_args)
+            try:
+                return self._denoise(batch, server_args)
+            finally:
+                if batch.rollout:
+                    batch.rollout_controllers.clear()
+                    batch._rollout_denoising_env_state = None
+
+    def _additional_rollout_final_states(
+        self, ctx: DenoisingContext, batch: Req
+    ) -> dict[str, RolloutFinalState]:
+        return {}
 
     @torch.no_grad()
     def _denoise(
@@ -2106,6 +2117,7 @@ class DenoisingStage(PipelineStage):
             pos_cond_kwargs=ctx.pos_cond_kwargs,
             neg_cond_kwargs=ctx.neg_cond_kwargs,
             guidance=ctx.guidance,
+            guidance_scale=batch.guidance_scale if batch.rollout_audio else None,
         )
         timesteps_cpu = self._run_denoising_loop(ctx, batch, server_args)
 
@@ -2116,6 +2128,7 @@ class DenoisingStage(PipelineStage):
             num_inference_steps=len(timesteps_cpu),
             final_timestep=ctx.timesteps.new_zeros(()),
             pipeline_config=server_args.pipeline_config,
+            additional_streams=self._additional_rollout_final_states(ctx, batch),
         )
         self._finalize_denoising_loop(ctx, batch, server_args)
         return batch

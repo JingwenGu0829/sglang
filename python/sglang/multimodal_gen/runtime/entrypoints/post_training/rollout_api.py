@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDebugTensors,
     RolloutDenoisingEnv,
     RolloutDitTrajectory,
+    RolloutStreamData,
     RolloutTrajectoryData,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
@@ -132,6 +133,7 @@ def _slice_rollout_trajectory_for_sample(
                 if env.guidance is not None
                 else None
             ),
+            guidance_scale=env.guidance_scale,
         )
     dit_trajectory = None
     if rtd.dit_trajectory:
@@ -147,6 +149,28 @@ def _slice_rollout_trajectory_for_sample(
         rollout_debug_tensors=debug_tensors,
         denoising_env=denoising_env,
         dit_trajectory=dit_trajectory,
+        audio=_slice_audio_rollout(rtd.audio, sample_idx, batch_size),
+    )
+
+
+def _slice_audio_rollout(
+    stream: RolloutStreamData | None, sample_idx: int, batch_size: int
+) -> RolloutStreamData | None:
+    if stream is None:
+        return None
+    sliced = _slice_rollout_trajectory_for_sample(
+        RolloutTrajectoryData(
+            rollout_log_probs=stream.rollout_log_probs,
+            rollout_debug_tensors=stream.rollout_debug_tensors,
+            dit_trajectory=stream.dit_trajectory,
+        ),
+        sample_idx,
+        batch_size,
+    )
+    return RolloutStreamData(
+        rollout_log_probs=sliced.rollout_log_probs,
+        rollout_debug_tensors=sliced.rollout_debug_tensors,
+        dit_trajectory=sliced.dit_trajectory,
     )
 
 
@@ -186,6 +210,8 @@ def _serialize_rollout_trajectory(
                 _maybe_serialize(env.guidance) if env.guidance is not None else None
             ),
         }
+        if env.guidance_scale is not None:
+            serialized_denoising_env["guidance_scale"] = env.guidance_scale
     serialized_dit_trajectory = None
     if rtd.dit_trajectory:
         dit = rtd.dit_trajectory
@@ -243,6 +269,20 @@ def _build_response(
             rollout_trajectory_data.dit_trajectory.sigmas
         )
 
+    audio = (
+        rollout_trajectory_data.audio if rollout and rollout_trajectory_data else None
+    )
+    audio_timesteps = (
+        _maybe_serialize(audio.dit_trajectory.timesteps)
+        if audio and audio.dit_trajectory
+        else None
+    )
+    audio_sigmas = (
+        _maybe_serialize(audio.dit_trajectory.sigmas)
+        if audio and audio.dit_trajectory
+        else None
+    )
+
     responses: list[RolloutResponse] = []
     for sample_idx in range(batch_size):
         out_i = result.output[sample_idx]
@@ -276,6 +316,27 @@ def _build_response(
             serialized_dit_timesteps=serialized_dit_timesteps,
             serialized_dit_sigmas=serialized_dit_sigmas,
         )
+        audio_rollout = None
+        if per_sample_trajectory.audio is not None:
+            stream = per_sample_trajectory.audio
+            audio_log_probs, audio_debug, _, audio_traj = _serialize_rollout_trajectory(
+                RolloutTrajectoryData(
+                    rollout_log_probs=stream.rollout_log_probs,
+                    rollout_debug_tensors=stream.rollout_debug_tensors,
+                    dit_trajectory=stream.dit_trajectory,
+                ),
+                serialized_dit_timesteps=audio_timesteps,
+                serialized_dit_sigmas=audio_sigmas,
+            )
+            audio_rollout = {
+                "rollout_log_probs": audio_log_probs,
+                "rollout_debug_tensors": audio_debug,
+                "dit_trajectory": audio_traj,
+                "generated_output": _maybe_serialize(result.audio[sample_idx])
+                if result.audio is not None
+                else None,
+                "sample_rate": result.audio_sample_rate,
+            }
         responses.append(
             RolloutResponse(
                 request_id=request_id,
@@ -286,6 +347,7 @@ def _build_response(
                 rollout_debug_tensors=serialized_debug_tensors,
                 denoising_env=serialized_denoising_env,
                 dit_trajectory=serialized_dit_trajectory,
+                audio_rollout=audio_rollout,
                 inference_time_s=inference_time_s,
                 peak_memory_mb=peak_memory_mb,
             )
@@ -309,6 +371,7 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
         fps=request.fps,
         image_path=request.image_path,
         rollout=request.rollout,
+        rollout_audio=request.rollout_audio,
         rollout_sde_type=request.rollout_sde_type,
         rollout_noise_level=request.rollout_noise_level,
         rollout_log_prob_no_const=request.rollout_log_prob_no_const,
@@ -345,6 +408,13 @@ async def rollout_generate(request: RolloutRequest):
     stamps.request_id = request_id
     server_args = get_global_server_args()
     sampling_kwargs = _build_sampling_kwargs(request)
+    if (
+        sampling_kwargs.get("rollout_audio")
+        and server_args.pipeline_class_name != "LTX2Pipeline"
+    ):
+        raise HTTPException(
+            status_code=400, detail="Audio rollout supports LTX2Pipeline only"
+        )
     try:
         sampling_params = build_sampling_params(request_id, **sampling_kwargs)
     except Exception as exc:

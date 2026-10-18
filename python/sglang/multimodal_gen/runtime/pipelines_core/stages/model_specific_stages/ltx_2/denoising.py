@@ -40,7 +40,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
+from sglang.multimodal_gen.runtime.post_training.audio_rollout import (
+    prepare_audio_rollout_if_enabled,
+)
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
+    AUDIO_STREAM,
+    RolloutFinalState,
     rollout_step_kwargs,
 )
 from sglang.multimodal_gen.runtime.server_args import (
@@ -1490,6 +1495,19 @@ class LTX2DenoisingStage(DenoisingStage):
         server_args: ServerArgs,
     ) -> LTX2DenoisingContext:
         """Extend the base context with LTX-2 audio, SP, and TI2V state."""
+        if batch.rollout_audio:
+            if (
+                server_args.pipeline_class_name != "LTX2Pipeline"
+                or self.sampler_name != "euler"
+                or batch.extra.get("ltx2_stage1_guider_params") is not None
+                or batch.image_path
+            ):
+                raise ValueError(
+                    "Audio rollout supports single-stage LTX Euler T2V only; "
+                    "TI2V, multi-stage and res2s sampling are not supported"
+                )
+            if not batch.generate_audio:
+                raise ValueError("Audio rollout requires generate_audio=True")
         self._disable_cache_dit_for_request = batch.image_path is not None
         base_ctx = super()._prepare_denoising_loop(batch, server_args)
         ctx = LTX2DenoisingContext(**base_ctx.to_kwargs())
@@ -1516,6 +1534,12 @@ class LTX2DenoisingStage(DenoisingStage):
         ctx.audio_latents = batch.audio_latents
         # Video and audio keep separate scheduler state throughout the denoising loop.
         ctx.audio_scheduler = clone_scheduler_runtime(ctx.scheduler)
+        prepare_audio_rollout_if_enabled(
+            batch=batch,
+            pipeline_config=server_args.pipeline_config,
+            scheduler=ctx.audio_scheduler,
+            latents=ctx.audio_latents,
+        )
 
         if ctx.use_ltx23_legacy_one_stage:
             batch.ltx23_audio_replicated_for_sp = False
@@ -1603,6 +1627,51 @@ class LTX2DenoisingStage(DenoisingStage):
             self._move_ltx2_scheduler_tensors_to_device(ctx.scheduler, device)
             self._move_ltx2_scheduler_tensors_to_device(ctx.audio_scheduler, device)
 
+        if batch.rollout_audio and batch.rollout_return_denoising_env:
+            # Full gathered trajectories are replayed without rank-local RoPE
+            # coordinates or SP padding. Snapshot both streams' static inputs.
+            ctx.image_kwargs = {
+                **ctx.image_kwargs,
+                "num_frames": int(
+                    (batch.num_frames - 1)
+                    // server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
+                    + 1
+                ),
+                "height": ctx.latent_height,
+                "width": ctx.latent_width,
+                "fps": batch.fps,
+                "audio_num_frames": batch.rollout_controllers[
+                    AUDIO_STREAM
+                ].latents_shape[1],
+                "return_dict": False,
+                "return_latents": False,
+            }
+            prompt_mask = self._get_ltx_prompt_attention_mask(
+                batch,
+                is_ltx23_variant=ctx.is_ltx23_variant
+                and not ctx.use_ltx23_legacy_one_stage,
+            )
+            ctx.pos_cond_kwargs = {
+                "encoder_hidden_states": batch.prompt_embeds[0],
+                "audio_encoder_hidden_states": batch.audio_prompt_embeds[0],
+                "encoder_attention_mask": prompt_mask,
+                "audio_encoder_attention_mask": prompt_mask,
+            }
+            if batch.do_classifier_free_guidance:
+                neg_mask = self._get_ltx_prompt_attention_mask(
+                    batch,
+                    is_ltx23_variant=ctx.is_ltx23_variant
+                    and not ctx.use_ltx23_legacy_one_stage,
+                    negative=True,
+                )
+                ctx.neg_cond_kwargs = {
+                    "encoder_hidden_states": batch.negative_prompt_embeds[0],
+                    "audio_encoder_hidden_states": batch.negative_audio_prompt_embeds[
+                        0
+                    ],
+                    "encoder_attention_mask": neg_mask,
+                    "audio_encoder_attention_mask": neg_mask,
+                }
         return ctx
 
     @staticmethod
@@ -1906,7 +1975,11 @@ class LTX2DenoisingStage(DenoisingStage):
                     return_dict=False,
                 )[0]
                 ctx.audio_latents = ctx.audio_scheduler.step(
-                    model_audio, step.t_device, ctx.audio_latents, return_dict=False
+                    model_audio,
+                    step.t_device,
+                    ctx.audio_latents,
+                    **rollout_step_kwargs(batch, stream=AUDIO_STREAM),
+                    return_dict=False,
                 )[0]
                 if ctx.denoise_mask is not None and ctx.clean_latent is not None:
                     ctx.latents = (
@@ -2551,6 +2624,19 @@ class LTX2DenoisingStage(DenoisingStage):
             server_args=server_args,
             is_warmup=ctx.is_warmup,
         )
+
+    def _additional_rollout_final_states(
+        self, ctx: LTX2DenoisingContext, batch: Req
+    ) -> dict[str, RolloutFinalState]:
+        if AUDIO_STREAM not in batch.rollout_controllers:
+            return {}
+        return {
+            AUDIO_STREAM: RolloutFinalState(
+                latents=ctx.audio_latents,
+                num_inference_steps=len(ctx.audio_scheduler.timesteps),
+                final_timestep=ctx.audio_scheduler.timesteps.new_zeros(()),
+            )
+        }
 
     def _post_denoising_loop(
         self,

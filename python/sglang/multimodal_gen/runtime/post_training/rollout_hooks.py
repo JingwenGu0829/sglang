@@ -11,6 +11,7 @@ serving requests.
 from __future__ import annotations
 
 import functools
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
@@ -25,6 +26,7 @@ from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import 
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDenoisingEnv,
     RolloutDitTrajectory,
+    RolloutStreamData,
     RolloutTrajectoryData,
 )
 from sglang.multimodal_gen.runtime.post_training.sp_utils import (
@@ -33,6 +35,14 @@ from sglang.multimodal_gen.runtime.post_training.sp_utils import (
 
 # Key of the image/video latent stream in ``Req.rollout_controllers``.
 VISUAL_STREAM = "visual"
+AUDIO_STREAM = "audio"
+
+
+@dataclass
+class RolloutFinalState:
+    latents: torch.Tensor
+    num_inference_steps: int
+    final_timestep: torch.Tensor
 
 
 def _kwargs_to_cpu(d: Any) -> Any:
@@ -47,11 +57,11 @@ def _kwargs_to_cpu(d: Any) -> Any:
     return d
 
 
-def rollout_step_kwargs(batch: Req) -> dict[str, Any]:
+def rollout_step_kwargs(batch: Req, stream: str = VISUAL_STREAM) -> dict[str, Any]:
     """The rollout-only keyword arguments of ``scheduler.step`` for this request:
-    the visual-stream controller's ``transition``. Empty for a serving request, so
+    the selected stream controller's ``transition``. Empty for a serving request, so
     its step call is unchanged and works with any scheduler."""
-    current_rollout_controller = batch.rollout_controllers.get(VISUAL_STREAM)
+    current_rollout_controller = batch.rollout_controllers.get(stream)
     if current_rollout_controller is None:
         return {}
     return {
@@ -69,15 +79,11 @@ def _build_scheduler_rollout_controller(
     if not isinstance(scheduler, FlowMatchEulerDiscreteScheduler):
         raise ValueError(f"Scheduler {type(scheduler)} does not support rollout")
 
-    current_rollout_controller = FlowRolloutController(
-        sde_type=batch.rollout_sde_type,
-        noise_level=float(batch.rollout_noise_level),
-        log_prob_no_const=batch.rollout_log_prob_no_const,
-        debug_mode=batch.rollout_debug_mode,
-        sde_step_indices=batch.rollout_sde_step_indices,
+    return build_flow_rollout_controller(
+        batch=batch,
+        sigmas=scheduler.sigmas,
+        latents=batch.latents,
         generator=batch.generator,
-        return_dit_trajectory=batch.rollout_return_dit_trajectory,
-        return_step_indices=batch.rollout_return_step_indices,
         shard_for_sp=lambda batch, latents: pipeline_config.shard_latents_for_sp(
             batch=batch, latents=latents
         )[0],
@@ -86,21 +92,47 @@ def _build_scheduler_rollout_controller(
             batch=batch,
             stacked_latents=stacked_latents,
         ),
-        sigmas=scheduler.sigmas,
-        latents_shape=tuple(batch.latents.shape),
     )
-    return current_rollout_controller
+
+
+def build_flow_rollout_controller(
+    *,
+    batch: Req,
+    sigmas: torch.Tensor,
+    latents: torch.Tensor,
+    generator: torch.Generator | list[torch.Generator],
+    shard_for_sp: Callable,
+    gather_for_sp: Callable,
+    ode_transition: Callable | None = None,
+) -> FlowRolloutController:
+    """Build a stream controller before sharding, without capturing its request."""
+    return FlowRolloutController(
+        sde_type=batch.rollout_sde_type,
+        noise_level=float(batch.rollout_noise_level),
+        log_prob_no_const=batch.rollout_log_prob_no_const,
+        debug_mode=batch.rollout_debug_mode,
+        sde_step_indices=batch.rollout_sde_step_indices,
+        generator=generator,
+        return_dit_trajectory=batch.rollout_return_dit_trajectory,
+        return_step_indices=batch.rollout_return_step_indices,
+        shard_for_sp=shard_for_sp,
+        gather_for_sp=gather_for_sp,
+        sigmas=sigmas,
+        latents_shape=tuple(latents.shape),
+        ode_transition=ode_transition,
+    )
 
 
 def prepare_rollout_if_enabled(
     *,
     batch: Req,
     pipeline_config: Any,
+    stream: str = VISUAL_STREAM,
     build_controller: Callable[..., FlowRolloutController] = (
         _build_scheduler_rollout_controller
     ),
 ) -> None:
-    """Create the rollout controller of the visual stream of this request.
+    """Register one stream's controller without replacing the other streams.
 
     Must run before SP sharding so the controller records the full latent shape.
     ``build_controller(batch=, pipeline_config=)`` returns it; a loop without a
@@ -108,10 +140,12 @@ def prepare_rollout_if_enabled(
     """
     if not batch.rollout:
         return
+    if stream in batch.rollout_controllers:
+        raise RuntimeError(f"Rollout stream {stream!r} was already prepared")
     current_rollout_controller = build_controller(
         batch=batch, pipeline_config=pipeline_config
     )
-    batch.rollout_controllers = {VISUAL_STREAM: current_rollout_controller}
+    batch.rollout_controllers[stream] = current_rollout_controller
 
 
 def init_rollout_env_if_enabled(
@@ -121,6 +155,7 @@ def init_rollout_env_if_enabled(
     pos_cond_kwargs: dict[str, Any],
     neg_cond_kwargs: dict[str, Any],
     guidance: torch.Tensor | None,
+    guidance_scale: float | None = None,
 ) -> None:
     """Snapshot the DiT conditioning that the trainer replays."""
     if not batch.rollout:
@@ -139,6 +174,7 @@ def init_rollout_env_if_enabled(
                 _kwargs_to_cpu(neg_cond_kwargs) if neg_cond_kwargs else None
             ),
             guidance=guidance.detach().cpu() if guidance is not None else None,
+            guidance_scale=guidance_scale,
         )
         pos_src = pos_cond_kwargs
         neg_src = neg_cond_kwargs
@@ -161,6 +197,7 @@ def finalize_rollout_if_enabled(
     num_inference_steps: int,
     final_timestep: torch.Tensor,
     pipeline_config: Any,
+    additional_streams: dict[str, RolloutFinalState] | None = None,
 ) -> None:
     """Finalize rollout-only outputs.
 
@@ -170,39 +207,26 @@ def finalize_rollout_if_enabled(
     """
     if not batch.rollout:
         return
-    current_rollout_controller = batch.rollout_controllers[VISUAL_STREAM]
+    states = {
+        VISUAL_STREAM: RolloutFinalState(latents, num_inference_steps, final_timestep),
+        **(additional_streams or {}),
+    }
+    if states.keys() != batch.rollout_controllers.keys():
+        raise RuntimeError("Rollout final states must match the prepared streams")
     if batch.rollout_trajectory_data is None:
         batch.rollout_trajectory_data = RolloutTrajectoryData()
-    batch.rollout_trajectory_data.rollout_log_probs = (
-        current_rollout_controller.collect_rollout_log_probs()
-    )
-    if batch.rollout_debug_mode:
-        batch.rollout_trajectory_data.rollout_debug_tensors = (
-            current_rollout_controller.collect_rollout_debug_tensors(batch)
-        )
-
-    # Append final denoised latent as the (T+1)-th entry (step_index=T),
-    # routed through the same filter so rollout_return_step_indices can
-    # include/exclude it.
-    current_rollout_controller.record_trajectory_step(
-        latents=latents,
-        timestep_value=final_timestep,
-        step_index=num_inference_steps,
-    )
-    step_latents = current_rollout_controller.step_latents
-    if step_latents:
-        batch.rollout_trajectory_data.dit_trajectory = RolloutDitTrajectory(
-            latents=current_rollout_controller.gather_for_sp(
-                batch, torch.stack(step_latents, dim=1)
-            ).cpu(),
-            timesteps=torch.stack(
-                current_rollout_controller.step_timesteps, dim=0
-            ).cpu(),
-            sigmas=current_rollout_controller.sigmas.detach().cpu().clone(),
-            latent_step_indices=torch.tensor(
-                current_rollout_controller.step_latent_indices, dtype=torch.long
-            ),
-        )
+    for stream, state in states.items():
+        data = _collect_stream_rollout(batch, batch.rollout_controllers[stream], state)
+        if stream == VISUAL_STREAM:
+            batch.rollout_trajectory_data.rollout_log_probs = data.rollout_log_probs
+            batch.rollout_trajectory_data.rollout_debug_tensors = (
+                data.rollout_debug_tensors
+            )
+            batch.rollout_trajectory_data.dit_trajectory = data.dit_trajectory
+        elif stream == AUDIO_STREAM:
+            batch.rollout_trajectory_data.audio = data
+        else:
+            raise ValueError(f"Unsupported rollout stream: {stream!r}")
 
     state = batch._rollout_denoising_env_state
     if state is not None and state["env"] is not None:
@@ -222,3 +246,30 @@ def finalize_rollout_if_enabled(
 
     batch._rollout_denoising_env_state = None
     batch.rollout_controllers = {}
+
+
+def _collect_stream_rollout(
+    batch: Req,
+    controller: FlowRolloutController,
+    state: RolloutFinalState,
+) -> RolloutStreamData:
+    data = RolloutStreamData(rollout_log_probs=controller.collect_rollout_log_probs())
+    if controller.debug_mode:
+        data.rollout_debug_tensors = controller.collect_rollout_debug_tensors(batch)
+    controller.record_trajectory_step(
+        latents=state.latents,
+        timestep_value=state.final_timestep,
+        step_index=state.num_inference_steps,
+    )
+    if controller.step_latents:
+        data.dit_trajectory = RolloutDitTrajectory(
+            latents=controller.gather_for_sp(
+                batch, torch.stack(controller.step_latents, dim=1)
+            ).cpu(),
+            timesteps=torch.stack(controller.step_timesteps).cpu(),
+            sigmas=controller.sigmas.detach().cpu().clone(),
+            latent_step_indices=torch.tensor(
+                controller.step_latent_indices, dtype=torch.long
+            ),
+        )
+    return data

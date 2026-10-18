@@ -393,6 +393,7 @@ class SamplingParams:
     save_output: bool = True
     return_frames: bool = field(default=False, metadata={"batch_sig_exclude": True})
     rollout: bool = False
+    rollout_audio: bool = False
     rollout_sde_type: str = "sde"
     rollout_noise_level: float = 0.7
     rollout_log_prob_no_const: bool = False  # exclude constants in rollout logprob
@@ -775,6 +776,10 @@ class SamplingParams:
         """
         check if the sampling params is compatible and valid with server_args
         """
+        if self.rollout_audio and not getattr(
+            pipeline_config, "supports_audio_rollout", False
+        ):
+            raise ValueError("This pipeline does not support audio rollout")
         task_type = self.resolve_task_type(pipeline_config)
         if task_type.is_action_gen():
             return

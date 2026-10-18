@@ -241,6 +241,52 @@ sglang generate \
 Some community LoRAs only include weights for transformer blocks. In that case, SGLang logs a concise coverage summary and leaves unmatched LoRA-capable layers on the base model weights. This is expected when the adapter format intentionally omits those layers.
 </Note>
 
+### 4.3 Audio RL rollout
+
+On the `sglang-miles` branch, you can collect audio transition log-probabilities
+alongside video through `POST /rollout/generate`. Use a Linux GPU deployment
+with `LTX2Pipeline` and single-stage Euler text-to-video generation. Audio rollout
+does not support image conditioning, two-stage pipelines, or res2s sampling.
+
+Set `rollout_audio` to `true` in the request. It defaults to `false` and requires
+`rollout: true`. Both streams use the same `rollout_sde_type`, noise level, and
+step filters. The following JSON is a request body for an existing server:
+
+```json
+{
+  "prompt": "A pianist plays a grand piano in a quiet concert hall",
+  "seed": 42,
+  "generator_device": "cuda",
+  "rollout": true,
+  "rollout_audio": true,
+  "rollout_sde_type": "sde",
+  "rollout_noise_level": 0.7,
+  "rollout_return_denoising_env": true,
+  "rollout_return_dit_trajectory": true
+}
+```
+
+The response uses the rollout API's MessagePack tensor encoding. Existing
+top-level `rollout_log_probs`, `rollout_debug_tensors`, and `dit_trajectory` fields
+describe the visual stream. The additional `audio_rollout` object contains:
+
+| Field | Contents |
+| --- | --- |
+| `rollout_log_probs` | Per-step audio log-probabilities, averaged over valid latent elements, using the same definition as visual rollout. |
+| `rollout_debug_tensors` | Audio noise, transition means, standard deviations, and model outputs when debug collection is enabled. |
+| `dit_trajectory` | Audio latents, the complete timestep/sigma grid, and `latent_step_indices`. |
+| `generated_output` | Decoded audio waveform for reward evaluation, when available. |
+| `sample_rate` | The decoded audio's sample rate. |
+
+The shared `denoising_env` includes both streams' prompt conditioning and the CFG
+scale. To replay an AV prediction, use video and audio latents with the same
+step index. `rollout_return_step_indices` filters retained latents in both
+streams; timestep/sigma grids and per-step log-probabilities remain complete.
+An independent audio RNG preserves the visual RNG's draw sequence. Enabling
+audio noise can still change video predictions because the model couples the
+two streams. The server returns each stream's log-probabilities separately;
+adding the two per-element averages does not produce a joint log-probability.
+
 ## 5. Practical Tips
 
 - Use `--pipeline-class-name LTX2TwoStagePipeline` as the default LTX two-stage quality path.

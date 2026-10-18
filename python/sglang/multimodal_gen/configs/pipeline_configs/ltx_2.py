@@ -1,6 +1,6 @@
 import dataclasses
 from dataclasses import field
-from typing import Callable, Optional
+from typing import Callable, ClassVar, Optional
 
 import torch
 
@@ -175,6 +175,8 @@ def _gemma_postprocess_func(
 @dataclasses.dataclass
 class LTX2PipelineConfig(PipelineConfig):
     """Configuration for LTX-Video pipeline."""
+
+    supports_audio_rollout: ClassVar[bool] = True
 
     task_type: ModelTaskType = ModelTaskType.TI2V
     skip_input_image_preprocess: bool = True
