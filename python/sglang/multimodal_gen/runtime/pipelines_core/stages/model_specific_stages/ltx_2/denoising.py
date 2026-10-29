@@ -1572,6 +1572,10 @@ class LTX2DenoisingStage(DenoisingStage):
             num_img_tokens=int(getattr(batch, "ltx2_num_image_tokens", 0)),
         )
         do_ti2v = bool(ti2v_spans)
+        if do_ti2v and batch.rollout:
+            # Conditioned tokens are reset to clean latents after every step,
+            # which the rollout transition log-probs do not model.
+            raise ValueError("LTX-2 rollout supports text-to-video only")
         if do_ti2v:
             if not (isinstance(ctx.latents, torch.Tensor) and ctx.latents.ndim == 3):
                 raise ValueError("LTX-2 TI2V expects packed token latents [B, S, D].")

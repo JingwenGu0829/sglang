@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 from sglang.multimodal_gen.runtime.post_training.audio_rollout import (
     audio_rollout_generators,
     prepare_audio_rollout_if_enabled,
+    validate_audio_rollout_request,
 )
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     concat_rollout_trajectory_data,
@@ -158,6 +159,55 @@ def test_audio_steps_finalize_and_survive_output_slicing(batch):
         assert audio["dit_trajectory"]["latent_step_indices"].tolist() == [0, 2]
         torch.testing.assert_close(audio["generated_output"], result.audio[i])
         assert audio["sample_rate"] == 24000
+
+
+def test_sp_sharded_audio_fails_instead_of_returning_one_shard(batch):
+    """SP-sharded audio latents must fail, not come back as one rank's shard."""
+    batch.rollout_sde_type = "ode"
+    batch.rollout_log_prob_no_const = True
+    audio_scheduler = copy.deepcopy(batch.scheduler)
+    with pytest.raises(RuntimeError, match="replicated across SP ranks"):
+        with rollout_scope(batch):
+            prepare_rollout_if_enabled(batch=batch, pipeline_config=_CONFIG)
+            prepare_audio_rollout_if_enabled(
+                batch=batch,
+                pipeline_config=_CONFIG,
+                scheduler=audio_scheduler,
+                latents=batch.audio_latents,
+            )
+            batch.did_sp_shard_audio_latents = True
+            for timestep in batch.scheduler.timesteps:
+                batch.latents = batch.scheduler.step(
+                    torch.zeros_like(batch.latents),
+                    timestep,
+                    batch.latents,
+                    **rollout_step_kwargs(batch),
+                    return_dict=False,
+                )[0]
+                batch.audio_latents = audio_scheduler.step(
+                    torch.zeros_like(batch.audio_latents),
+                    timestep,
+                    batch.audio_latents,
+                    **rollout_step_kwargs(batch, AUDIO_STREAM),
+                    return_dict=False,
+                )[0]
+            finalize_rollout_if_enabled(
+                batch=batch,
+                latents=batch.latents,
+                num_inference_steps=2,
+                final_timestep=torch.tensor(0.0),
+                pipeline_config=_CONFIG,
+                additional_latents={AUDIO_STREAM: batch.audio_latents},
+            )
+    assert batch.rollout_trajectory_data is None
+
+
+def test_audio_rollout_rejects_denoising_env(batch):
+    """The replay env has no audio conditioning, so audio rollout rejects it."""
+    batch.rollout_return_denoising_env = True
+    server_args = SimpleNamespace(pipeline_class_name="LTX2Pipeline")
+    with pytest.raises(ValueError, match="rollout_return_denoising_env"):
+        validate_audio_rollout_request(batch, server_args)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

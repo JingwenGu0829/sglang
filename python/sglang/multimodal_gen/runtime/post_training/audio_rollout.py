@@ -40,12 +40,26 @@ def validate_audio_rollout_request(batch, server_args) -> None:
     """Validate active audio rollouts using the pipeline selected for serving."""
     if not (batch.rollout and batch.rollout_audio):
         return
+    if batch.rollout_return_denoising_env:
+        raise ValueError(
+            "Audio rollout does not support rollout_return_denoising_env: "
+            "the replay environment has no audio conditioning"
+        )
     from sglang.multimodal_gen.registry import get_served_pipeline_class
 
     pipeline_cls = get_served_pipeline_class(server_args)
     if pipeline_cls is None:
         raise ValueError("Could not resolve the pipeline for audio rollout")
     pipeline_cls.validate_audio_rollout_request(batch)
+
+
+def _replicated_audio(batch, tensor):
+    # The audio controller draws full-shape noise and records whole latents per rank.
+    if batch.did_sp_shard_audio_latents:
+        raise RuntimeError(
+            "Audio rollout requires audio latents replicated across SP ranks"
+        )
+    return tensor
 
 
 def prepare_audio_rollout_if_enabled(*, batch, pipeline_config, scheduler, latents):
@@ -64,8 +78,8 @@ def prepare_audio_rollout_if_enabled(*, batch, pipeline_config, scheduler, laten
             sigmas=scheduler.sigmas,
             latents=latents,
             generator=generators,
-            shard_for_sp=lambda batch, noise: noise,
-            gather_for_sp=lambda batch, trajectory: trajectory,
+            shard_for_sp=_replicated_audio,
+            gather_for_sp=_replicated_audio,
         )
 
     prepare_rollout_if_enabled(

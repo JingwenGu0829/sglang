@@ -81,13 +81,11 @@ def _concat_stream_data(
         )
     trajectory = None
     if all(stream.dit_trajectory is not None for stream in streams):
-        trajectory = RolloutDitTrajectory(
+        trajectory = replace(
+            first.dit_trajectory,
             latents=_cat_per_output(
                 [stream.dit_trajectory.latents for stream in streams]
             ),
-            timesteps=first.dit_trajectory.timesteps,
-            sigmas=first.dit_trajectory.sigmas,
-            latent_step_indices=first.dit_trajectory.latent_step_indices,
         )
     return replace(
         first,
@@ -137,11 +135,8 @@ def _select_stream_data(
         )
     trajectory = stream.dit_trajectory
     if trajectory is not None:
-        trajectory = RolloutDitTrajectory(
-            latents=_slice_output_dim(trajectory.latents, output_index),
-            timesteps=trajectory.timesteps,
-            sigmas=trajectory.sigmas,
-            latent_step_indices=trajectory.latent_step_indices,
+        trajectory = replace(
+            trajectory, latents=_slice_output_dim(trajectory.latents, output_index)
         )
     return replace(
         stream,
