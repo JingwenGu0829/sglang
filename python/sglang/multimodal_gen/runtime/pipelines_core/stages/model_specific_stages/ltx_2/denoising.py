@@ -40,7 +40,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
+from sglang.multimodal_gen.runtime.post_training.audio_rollout import (
+    prepare_audio_rollout_if_enabled,
+)
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
+    AUDIO_STREAM,
     rollout_step_kwargs,
 )
 from sglang.multimodal_gen.runtime.server_args import (
@@ -1516,6 +1520,12 @@ class LTX2DenoisingStage(DenoisingStage):
         ctx.audio_latents = batch.audio_latents
         # Video and audio keep separate scheduler state throughout the denoising loop.
         ctx.audio_scheduler = clone_scheduler_runtime(ctx.scheduler)
+        prepare_audio_rollout_if_enabled(
+            batch=batch,
+            pipeline_config=server_args.pipeline_config,
+            scheduler=ctx.audio_scheduler,
+            latents=ctx.audio_latents,
+        )
 
         if ctx.use_ltx23_legacy_one_stage:
             batch.ltx23_audio_replicated_for_sp = False
@@ -1562,6 +1572,10 @@ class LTX2DenoisingStage(DenoisingStage):
             num_img_tokens=int(getattr(batch, "ltx2_num_image_tokens", 0)),
         )
         do_ti2v = bool(ti2v_spans)
+        if do_ti2v and batch.rollout:
+            # Conditioned tokens are reset to clean latents after every step,
+            # which the rollout transition log-probs do not model.
+            raise ValueError("LTX-2 rollout supports text-to-video only")
         if do_ti2v:
             if not (isinstance(ctx.latents, torch.Tensor) and ctx.latents.ndim == 3):
                 raise ValueError("LTX-2 TI2V expects packed token latents [B, S, D].")
@@ -1906,7 +1920,11 @@ class LTX2DenoisingStage(DenoisingStage):
                     return_dict=False,
                 )[0]
                 ctx.audio_latents = ctx.audio_scheduler.step(
-                    model_audio, step.t_device, ctx.audio_latents, return_dict=False
+                    model_audio,
+                    step.t_device,
+                    ctx.audio_latents,
+                    **rollout_step_kwargs(batch, stream=AUDIO_STREAM),
+                    return_dict=False,
                 )[0]
                 if ctx.denoise_mask is not None and ctx.clean_latent is not None:
                     ctx.latents = (
@@ -2551,6 +2569,13 @@ class LTX2DenoisingStage(DenoisingStage):
             server_args=server_args,
             is_warmup=ctx.is_warmup,
         )
+
+    def _additional_rollout_latents(
+        self, ctx: LTX2DenoisingContext, batch: Req
+    ) -> dict[str, torch.Tensor]:
+        if AUDIO_STREAM not in batch.rollout_controllers:
+            return {}
+        return {AUDIO_STREAM: ctx.audio_latents}
 
     def _post_denoising_loop(
         self,
