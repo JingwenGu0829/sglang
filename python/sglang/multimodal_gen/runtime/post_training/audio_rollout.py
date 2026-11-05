@@ -40,11 +40,6 @@ def validate_audio_rollout_request(batch, server_args) -> None:
     """Validate active audio rollouts using the pipeline selected for serving."""
     if not (batch.rollout and batch.rollout_audio):
         return
-    if batch.rollout_return_denoising_env:
-        raise ValueError(
-            "Audio rollout does not support rollout_return_denoising_env: "
-            "the replay environment has no audio conditioning"
-        )
     from sglang.multimodal_gen.registry import get_served_pipeline_class
 
     pipeline_cls = get_served_pipeline_class(server_args)

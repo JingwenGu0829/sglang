@@ -32,14 +32,19 @@ from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     expand_request_outputs,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingContext,
+    DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2 import (
+    denoising as ltx2_denoising,
 )
 from sglang.multimodal_gen.runtime.post_training.audio_rollout import (
     audio_rollout_generators,
     prepare_audio_rollout_if_enabled,
-    validate_audio_rollout_request,
 )
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     concat_rollout_trajectory_data,
@@ -202,12 +207,88 @@ def test_sp_sharded_audio_fails_instead_of_returning_one_shard(batch):
     assert batch.rollout_trajectory_data is None
 
 
-def test_audio_rollout_rejects_denoising_env(batch):
-    """The replay env has no audio conditioning, so audio rollout rejects it."""
+@pytest.mark.parametrize(
+    "pipeline_class_name,pass_text_mask",
+    [("LTX2Pipeline", True), ("LTX2TwoStagePipeline", False)],
+)
+def test_ltx2_replay_env_holds_text_conditioning_of_both_streams(
+    monkeypatch, batch, pipeline_class_name, pass_text_mask
+):
+    """The LTX-2 replay env must carry the audio text context and the text masks the DiT read."""
     batch.rollout_return_denoising_env = True
-    server_args = SimpleNamespace(pipeline_class_name="LTX2Pipeline")
-    with pytest.raises(ValueError, match="rollout_return_denoising_env"):
-        validate_audio_rollout_request(batch, server_args)
+    batch.do_classifier_free_guidance = True
+    batch.height = batch.width = 64
+    batch.num_frames = 9
+    batch.prompt_embeds = [torch.randn(2, 3, 4)]
+    batch.negative_prompt_embeds = [torch.randn(2, 3, 4)]
+    batch.audio_prompt_embeds = [torch.randn(2, 3, 2)]
+    batch.negative_audio_prompt_embeds = [torch.randn(2, 3, 2)]
+    batch.prompt_attention_mask = torch.ones(2, 3)
+    batch.negative_attention_mask = torch.zeros(2, 3)
+    generic_kwargs = {
+        "encoder_hidden_states": batch.prompt_embeds[0],
+        "encoder_attention_mask": batch.prompt_attention_mask,
+    }
+    base_ctx = DenoisingContext(
+        scheduler=batch.scheduler,
+        extra_step_kwargs={},
+        target_dtype=torch.float32,
+        autocast_enabled=False,
+        timesteps=batch.scheduler.timesteps,
+        num_inference_steps=2,
+        num_warmup_steps=0,
+        image_kwargs={},
+        pos_cond_kwargs=generic_kwargs,
+        neg_cond_kwargs=dict(generic_kwargs),
+        latents=batch.latents,
+        boundary_timestep=None,
+        z=None,
+        reserved_frames_mask=None,
+        seq_len=None,
+        guidance=None,
+        is_warmup=False,
+    )
+    monkeypatch.setattr(
+        DenoisingStage, "_prepare_denoising_loop", lambda *args: base_ctx
+    )
+    monkeypatch.setattr(ltx2_denoising, "is_ltx23_native_variant", lambda _: True)
+    monkeypatch.setattr(ltx2_denoising, "get_sp_world_size", lambda: 1)
+    server_args = SimpleNamespace(
+        pipeline_class_name=pipeline_class_name,
+        enable_cfg_parallel=False,
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(
+                    spatial_compression_ratio=32, temporal_compression_ratio=8
+                )
+            ),
+            can_shard_audio_latents_for_sp=lambda latents: False,
+        ),
+    )
+    stage = object.__new__(ltx2_denoising.LTX2DenoisingStage)
+    stage.server_args = server_args
+
+    ctx = stage._prepare_denoising_loop(batch, server_args)
+
+    pos_mask = batch.prompt_attention_mask if pass_text_mask else None
+    neg_mask = batch.negative_attention_mask if pass_text_mask else None
+    assert ctx.pos_cond_kwargs["encoder_hidden_states"] is batch.prompt_embeds[0]
+    assert (
+        ctx.pos_cond_kwargs["audio_encoder_hidden_states"]
+        is (batch.audio_prompt_embeds[0])
+    )
+    assert ctx.pos_cond_kwargs["encoder_attention_mask"] is pos_mask
+    assert ctx.pos_cond_kwargs["audio_encoder_attention_mask"] is pos_mask
+    assert (
+        ctx.neg_cond_kwargs["encoder_hidden_states"]
+        is (batch.negative_prompt_embeds[0])
+    )
+    assert (
+        ctx.neg_cond_kwargs["audio_encoder_hidden_states"]
+        is (batch.negative_audio_prompt_embeds[0])
+    )
+    assert ctx.neg_cond_kwargs["encoder_attention_mask"] is neg_mask
+    assert ctx.neg_cond_kwargs["audio_encoder_attention_mask"] is neg_mask
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

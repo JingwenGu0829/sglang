@@ -1340,6 +1340,29 @@ class LTX2DenoisingStage(DenoisingStage):
             }
         return kwargs
 
+    def _replay_text_cond_kwargs(
+        self, ctx: LTX2DenoisingContext, batch: Req, *, negative: bool
+    ) -> dict[str, object]:
+        """Video and audio text conditioning of the unperturbed DiT pass."""
+        prompt_embeds, audio_prompt_embeds = (
+            (batch.negative_prompt_embeds, batch.negative_audio_prompt_embeds)
+            if negative
+            else (batch.prompt_embeds, batch.audio_prompt_embeds)
+        )
+        return self._build_ltx2_model_kwargs(
+            ctx,
+            {},
+            encoder_hidden_states=prompt_embeds[0],
+            audio_encoder_hidden_states=audio_prompt_embeds[0],
+            encoder_attention_mask=self._get_ltx_prompt_attention_mask(
+                batch,
+                is_ltx23_variant=(
+                    ctx.is_ltx23_variant and not ctx.use_ltx23_legacy_one_stage
+                ),
+                negative=negative,
+            ),
+        )
+
     @staticmethod
     def _ltx2_guidance_perturbation_config(
         pass_spec: LTX2GuidancePassSpec,
@@ -1598,6 +1621,17 @@ class LTX2DenoisingStage(DenoisingStage):
                     clean_latent_background=clean_latent_background,
                 )
             )
+
+        if batch.rollout and batch.rollout_return_denoising_env:
+            # The DiT reads text from the batch; these kwargs only feed the replay env.
+            ctx.pos_cond_kwargs = ctx.pos_cond_kwargs | self._replay_text_cond_kwargs(
+                ctx, batch, negative=False
+            )
+            if batch.do_classifier_free_guidance:
+                ctx.neg_cond_kwargs = (
+                    ctx.neg_cond_kwargs
+                    | self._replay_text_cond_kwargs(ctx, batch, negative=True)
+                )
 
         # Batch tensors are broadcast from CFG rank 0 and remain on its device.
         # Move every context tensor that will be used in model forward passes or
