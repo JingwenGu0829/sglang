@@ -849,8 +849,8 @@ class LTX2Attention(nn.Module):
                 is_cross_attention=is_cross_attention,
                 prefix=f"{prefix}.attn",
                 enable_packed_qkv_input_a2a=self.enable_packed_qkv_input_a2a,
-                # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
-                allow_cudnn_sdp=True,
+                # mounted per request quality, see set_cudnn_sdpa
+                allow_cudnn_sdp=False,
                 capture_dense_attention=True,
             )
         else:
@@ -865,10 +865,22 @@ class LTX2Attention(nn.Module):
                 required_attention_backend=required_attention_backend,
                 is_cross_attention=is_cross_attention,
                 prefix=f"{prefix}.attn",
-                # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
-                allow_cudnn_sdp=True,
+                # mounted per request quality, see set_cudnn_sdpa
+                allow_cudnn_sdp=False,
                 capture_dense_attention=True,
             )
+
+    def set_cudnn_sdpa(self, enabled: bool) -> None:
+        """Opt this layer's torch SDPA in or out of cuDNN.
+
+        Official LTX-2 runs cuDNN SDPA, which the CUDA setup disables. cuDNN can
+        select a different kernel in another process for the same inputs, so
+        only requests above quality="exact" mount it.
+        """
+        self.attn.allow_cudnn_sdp = enabled
+        # autotune and backend overrides rebuild the impl from these kwargs
+        self.attn._attn_impl_ctor_kwargs["allow_cudnn_sdp"] = enabled
+        self.attn.attn_impl.allow_cudnn_sdp = enabled
 
     def forward(
         self,
@@ -1056,6 +1068,21 @@ class LTX2Attention(nn.Module):
             end = start + local_d
             return cos[:, :, start:end], sin[:, :, start:end]
         raise ValueError(f"Unexpected RoPE tensor rank: {cos.ndim}. Expected 3 or 4.")
+
+
+def _set_ltx2_cudnn_sdpa(root: nn.Module, enabled: bool) -> bool:
+    sites = [module for module in root.modules() if isinstance(module, LTX2Attention)]
+    for site in sites:
+        site.set_cudnn_sdpa(enabled)
+    return bool(sites)
+
+
+def mount_ltx2_cudnn_sdpa(root: nn.Module) -> bool:
+    return _set_ltx2_cudnn_sdpa(root, True)
+
+
+def unmount_ltx2_cudnn_sdpa(root: nn.Module) -> None:
+    _set_ltx2_cudnn_sdpa(root, False)
 
 
 class LTX2FeedForward(nn.Module):

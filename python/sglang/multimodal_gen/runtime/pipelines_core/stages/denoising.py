@@ -129,6 +129,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.models.dits.ltx_2 import (
+    mount_ltx2_cudnn_sdpa,
+    unmount_ltx2_cudnn_sdpa,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.component_loading import (
     load_transformer_if_needed,
     register_loaded_transformer,
@@ -234,6 +238,14 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "LTX-2 fused RMSNorm+modulate",
         mount_ltx2_rms_norm_modulate,
         unmount_ltx2_rms_norm_modulate,
+    ),
+    (
+        # the reference math on the official kernel family, but cuDNN can run
+        # a different kernel in another process, which moves BF16 rounding
+        "lossless",
+        "LTX-2 cuDNN SDPA",
+        mount_ltx2_cudnn_sdpa,
+        unmount_ltx2_cudnn_sdpa,
     ),
     (
         # Ideogram's reference keeps the norm statistics in fp32; the
