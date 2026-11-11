@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Audio stream wiring for a loop with an independent Euler scheduler."""
 
+from __future__ import annotations
+
 import hashlib
+from typing import Any
 
 import torch
 
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
+    FlowRolloutController,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     AUDIO_STREAM,
@@ -15,7 +22,9 @@ from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
 )
 
 
-def audio_rollout_generators(generators):
+def audio_rollout_generators(
+    generators: torch.Generator | list[torch.Generator] | None,
+) -> torch.Generator | list[torch.Generator]:
     """Derive per-sample audio RNGs without advancing the visual RNGs.
 
     The domain and seed are identical across SP/CFG ranks. Python's salted
@@ -24,7 +33,7 @@ def audio_rollout_generators(generators):
     if generators is None:
         raise ValueError("Audio rollout requires request generators")
 
-    def derive(generator):
+    def derive(generator: torch.Generator) -> torch.Generator:
         digest = hashlib.sha256(
             f"sglang/rollout/audio/{generator.initial_seed()}".encode()
         ).digest()
@@ -36,19 +45,7 @@ def audio_rollout_generators(generators):
     return [derive(generator) for generator in generators]
 
 
-def validate_audio_rollout_request(batch, server_args) -> None:
-    """Validate active audio rollouts using the pipeline selected for serving."""
-    if not (batch.rollout and batch.rollout_audio):
-        return
-    from sglang.multimodal_gen.registry import get_served_pipeline_class
-
-    pipeline_cls = get_served_pipeline_class(server_args)
-    if pipeline_cls is None:
-        raise ValueError("Could not resolve the pipeline for audio rollout")
-    pipeline_cls.validate_audio_rollout_request(batch)
-
-
-def _replicated_audio(batch, tensor):
+def _replicated_audio(batch: Req, tensor: torch.Tensor) -> torch.Tensor:
     # The audio controller draws full-shape noise and records whole latents per rank.
     if batch.did_sp_shard_audio_latents:
         raise RuntimeError(
@@ -57,7 +54,9 @@ def _replicated_audio(batch, tensor):
     return tensor
 
 
-def prepare_audio_rollout_if_enabled(*, batch, pipeline_config, scheduler, latents):
+def prepare_audio_rollout_if_enabled(
+    *, batch: Req, pipeline_config: Any, scheduler: Any, latents: torch.Tensor
+) -> None:
     """Register the replicated audio stream of single-stage LTX generation."""
     if not (batch.rollout and batch.rollout_audio):
         return
@@ -67,7 +66,7 @@ def prepare_audio_rollout_if_enabled(*, batch, pipeline_config, scheduler, laten
         raise ValueError("Audio rollout requires packed audio latents [B, S, D]")
     generators = audio_rollout_generators(batch.generator)
 
-    def build_controller(*, batch, pipeline_config):
+    def build_controller(*, batch: Req, pipeline_config: Any) -> FlowRolloutController:
         return build_flow_rollout_controller(
             batch=batch,
             sigmas=scheduler.sigmas,

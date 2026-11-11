@@ -98,6 +98,10 @@ class ComposedPipelineBase(ABC):
     default_model_subfolder: str | None = None
 
     @classmethod
+    def validate_rollout_request(cls, batch: Req) -> None:
+        """Reject a rollout whose transitions this pipeline's log-probs do not model."""
+
+    @classmethod
     def validate_audio_rollout_request(cls, batch: Req) -> None:
         raise ValueError(f"{cls.__name__} does not support audio rollout")
 

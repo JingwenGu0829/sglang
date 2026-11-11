@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Rollout hooks for denoise loops.
 
-A loop runs inside ``rollout_scope`` and calls ``prepare_rollout_if_enabled`` before SP sharding,
-``init_rollout_env_if_enabled`` at the loop start and
+A loop runs inside ``rollout_scope`` and calls ``prepare_rollout_if_enabled``
+before SP sharding, ``init_rollout_env_if_enabled`` at the loop start and
 ``finalize_rollout_if_enabled`` at the loop end, and passes
 ``**rollout_step_kwargs(batch)`` to ``scheduler.step``. Every hook is a no-op for
 serving requests.
@@ -36,6 +36,22 @@ from sglang.multimodal_gen.runtime.post_training.sp_utils import (
 # Key of the image/video latent stream in ``Req.rollout_controllers``.
 VISUAL_STREAM = "visual"
 AUDIO_STREAM = "audio"
+
+
+def validate_rollout_request(batch: Req, server_args: Any) -> None:
+    """Reject a rollout the serving pipeline cannot model, before model execution."""
+    if not batch.rollout:
+        return
+    from sglang.multimodal_gen.registry import get_served_pipeline_class
+
+    pipeline_cls = get_served_pipeline_class(server_args)
+    if pipeline_cls is None:
+        if batch.rollout_audio:
+            raise ValueError("Could not resolve the pipeline for audio rollout")
+        return
+    pipeline_cls.validate_rollout_request(batch)
+    if batch.rollout_audio:
+        pipeline_cls.validate_audio_rollout_request(batch)
 
 
 @contextmanager

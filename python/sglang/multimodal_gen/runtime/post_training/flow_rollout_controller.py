@@ -210,7 +210,7 @@ class FlowRolloutController:
         for i in range(B):
             row = buffer[i : i + 1]
             generator = generators[i]
-            if generator.device == device:
+            if generator.device.type == device.type:
                 torch.randn(row.shape, out=row, generator=generator)
             else:
                 # LTX-2 defaults to CPU generators even when latents are on CUDA.

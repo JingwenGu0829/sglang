@@ -360,12 +360,17 @@ async def rollout_generate(request: RolloutRequest):
     sampling_kwargs = _build_sampling_kwargs(request)
     try:
         sampling_params = build_sampling_params(request_id, **sampling_kwargs)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid sampling params: {exc}"
+        ) from exc
+    try:
         pipeline_request = prepare_request(
             server_args=server_args, sampling_params=sampling_params
         )
-    except (ValueError, TypeError) as exc:
+    except ValueError as exc:
         raise HTTPException(
-            status_code=400, detail=f"Invalid sampling params: {exc}"
+            status_code=400, detail=f"Invalid rollout request: {exc}"
         ) from exc
     try:
         with stamps.span("forward"):

@@ -214,7 +214,7 @@ def test_sp_sharded_audio_fails_instead_of_returning_one_shard(batch):
 def test_ltx2_replay_env_holds_text_conditioning_of_both_streams(
     monkeypatch, batch, pipeline_class_name, pass_text_mask
 ):
-    """The LTX-2 replay env must carry the audio text context and the text masks the DiT read."""
+    """The LTX-2 replay env carries the audio text context and the masks the DiT read."""
     batch.rollout_return_denoising_env = True
     batch.do_classifier_free_guidance = True
     batch.height = batch.width = 64
@@ -305,6 +305,34 @@ def test_cpu_generators_fill_cuda_noise_for_each_sample(batch):
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_generators_fill_cuda_noise_in_place(batch, monkeypatch):
+    """A "cuda" generator has no index, so it never compares equal to cuda:0."""
+    batch.generator = [torch.Generator("cuda").manual_seed(10 + i) for i in range(2)]
+    prepare_rollout_if_enabled(batch=batch, pipeline_config=_CONFIG)
+    controller = batch.rollout_controllers["visual"]
+    expected = torch.cat(
+        [
+            torch.randn(
+                1,
+                4,
+                2,
+                device="cuda",
+                generator=torch.Generator("cuda").manual_seed(10 + i),
+            )
+            for i in range(2)
+        ]
+    )
+    monkeypatch.setattr(
+        torch.Tensor,
+        "copy_",
+        lambda *args, **kwargs: pytest.fail("same-device noise must not be copied"),
+    )
+    actual = controller._rollout_variance_noise(batch, batch.latents.cuda())
+    monkeypatch.undo()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_expanded_outputs_do_not_share_controllers(batch):
     batch.num_outputs_per_prompt = 2
     children = expand_request_outputs(batch)
@@ -354,6 +382,52 @@ def test_stage_cleanup_allows_retry(batch, stage_cls, loop_name):
 def test_http_validates_the_resolved_pipeline(
     monkeypatch, pipeline, override, rollout, valid
 ):
+    forward = _serve(monkeypatch, pipeline, override)
+    request = RolloutRequest(
+        prompt="test", seed=42, rollout=rollout, rollout_audio=True
+    )
+    if valid:
+        assert asyncio.run(rollout_api.rollout_generate(request)).status_code == 200
+        forward.assert_awaited_once()
+    else:
+        _assert_rejected(request, forward)
+
+
+@pytest.mark.parametrize("pipeline", [LTX2Pipeline, LTX2TwoStagePipeline])
+@pytest.mark.parametrize("rollout_audio", [False, True])
+def test_http_rejects_image_conditioned_ltx_rollout(
+    monkeypatch, pipeline, rollout_audio
+):
+    """TI2V resets conditioned tokens every step, with or without audio rollout."""
+    forward = _serve(monkeypatch, pipeline, None)
+    request = RolloutRequest(
+        prompt="test",
+        seed=42,
+        rollout=True,
+        rollout_audio=rollout_audio,
+        image_path=["first_frame.png"],
+    )
+    _assert_rejected(request, forward)
+
+
+def test_http_reports_any_sampling_param_error_as_bad_request(monkeypatch):
+    forward = _serve(monkeypatch, LTX2Pipeline, None)
+
+    def build_sampling_params(request_id, **kwargs):
+        raise KeyError("unknown size")
+
+    monkeypatch.setattr(rollout_api, "build_sampling_params", build_sampling_params)
+    _assert_rejected(RolloutRequest(prompt="test", seed=42), forward)
+
+
+def _assert_rejected(request, forward):
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(rollout_api.rollout_generate(request))
+    assert error.value.status_code == 400
+    forward.assert_not_awaited()
+
+
+def _serve(monkeypatch, pipeline, override):
     args = SimpleNamespace(
         pipeline_class_name=override,
         model_path="test",
@@ -377,14 +451,4 @@ def test_http_validates_the_resolved_pipeline(
     forward = AsyncMock(return_value=OutputBatch(output=torch.zeros(1, 1)))
     monkeypatch.setattr(rollout_api.async_scheduler_client, "forward", forward)
     monkeypatch.setattr(rollout_api, "_build_response", lambda *a, **kw: [])
-    request = RolloutRequest(
-        prompt="test", seed=42, rollout=rollout, rollout_audio=True
-    )
-    if valid:
-        assert asyncio.run(rollout_api.rollout_generate(request)).status_code == 200
-        forward.assert_awaited_once()
-    else:
-        with pytest.raises(HTTPException) as error:
-            asyncio.run(rollout_api.rollout_generate(request))
-        assert error.value.status_code == 400
-        forward.assert_not_awaited()
+    return forward

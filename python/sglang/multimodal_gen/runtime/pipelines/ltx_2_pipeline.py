@@ -326,6 +326,13 @@ class LTX2FlowMatchScheduler(FlowMatchEulerDiscreteScheduler):
 
 
 class _BaseLTX2Pipeline(LoRAPipeline):
+    @classmethod
+    def validate_rollout_request(cls, batch: Req) -> None:
+        # Conditioned tokens are reset to clean latents after every step, which
+        # the rollout transition log-probs do not model.
+        if batch.image_path:
+            raise ValueError("LTX-2 rollout supports text-to-video only")
+
     _required_config_modules = [
         "transformer",
         "text_encoder",
