@@ -19,6 +19,7 @@ class RLRolloutArgs:
     """Rollout (log-prob trajectory) options used by SamplingParams and APIs."""
 
     rollout: bool = False
+    rollout_audio: bool = False
     rollout_sde_type: str = "sde"
     rollout_noise_level: float = 0.7
     rollout_log_prob_no_const: bool = False
@@ -80,6 +81,11 @@ class RLRolloutArgs:
             help="Enable rollout mode and return per-step log_prob trajectory",
         )
         add_argument(
+            "--rollout-audio",
+            action="store_true",
+            help="Enable audio rollout alongside visual rollout (LTX Euler only).",
+        )
+        add_argument(
             "--rollout-sde-type",
             type=str,
             choices=list(_VALID_ROLLOUT_SDE_TYPES),
@@ -108,6 +114,7 @@ class RLRolloutArgs:
     def from_dict(cls, kwargs: dict[str, Any]) -> RLRolloutArgs:
         return cls(
             rollout=bool(kwargs.get("rollout", cls.rollout)),
+            rollout_audio=bool(kwargs.get("rollout_audio", cls.rollout_audio)),
             rollout_sde_type=str(kwargs.get("rollout_sde_type", cls.rollout_sde_type)),
             rollout_noise_level=float(
                 kwargs.get("rollout_noise_level", cls.rollout_noise_level)

@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import fields, replace
 
 import torch
 
@@ -79,6 +80,24 @@ class TestMultiOutputRolloutTrajectory(unittest.TestCase):
             self.assertEqual(
                 tuple(entry.dit_trajectory.latents.shape), (1, _STEPS + 1, 2)
             )
+
+    def test_merge_and_select_keep_every_shared_trajectory_field(self):
+        """Every trajectory field but latents survives merge and select."""
+        shared = {
+            field.name: torch.arange(_STEPS + 1) + i
+            for i, field in enumerate(fields(RolloutDitTrajectory))
+            if field.name != "latents"
+        }
+        per_output = [_per_output_trajectory(i) for i in range(2)]
+        for data in per_output:
+            data.dit_trajectory = replace(data.dit_trajectory, **shared)
+
+        merged = concat_rollout_trajectory_data(per_output)
+        selected = select_output_rollout_trajectory(merged, 1)
+
+        for trajectory in (merged.dit_trajectory, selected.dit_trajectory):
+            for name, value in shared.items():
+                self.assertIs(getattr(trajectory, name), value)
 
     def test_select_without_output_index_returns_group_trajectory(self):
         merged = concat_rollout_trajectory_data(

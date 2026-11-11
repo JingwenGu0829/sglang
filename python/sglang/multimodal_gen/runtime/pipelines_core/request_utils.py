@@ -100,6 +100,9 @@ def expand_request_outputs(
         )
         output_metrics = deepcopy(req.metrics) if preserve_parent_metrics else None
         output_req = copy(req)
+        output_req.rollout_controllers = {}
+        output_req._rollout_denoising_env_state = None
+        output_req.rollout_trajectory_data = None
         output_req.sampling_params = copy(req.sampling_params)
         output_req.extra = dict(req.extra)
         output_req.condition_inputs = dict(req.condition_inputs)
